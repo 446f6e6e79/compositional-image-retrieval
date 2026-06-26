@@ -1,2 +1,7 @@
 /scripts/__pycache__
 *.pyc
+figures/__pycache__
+figures/*.png
+figures/*.pdf
+figures/*.aux
+figures/*.log
