@@ -1,6 +1,6 @@
 <mxfile host="app.diagrams.net">
   <diagram name="Pagina-1" id="kXfJv6P_LlORmQTPR4pQ">
-    <mxGraphModel grid="1" page="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" pageScale="1" pageWidth="827" pageHeight="1169" math="1" shadow="0">
+    <mxGraphModel dx="1710" dy="2475" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="827" pageHeight="1169" math="1" shadow="0">
       <root>
         <mxCell id="0" />
         <mxCell id="1" parent="0" />
@@ -13,7 +13,7 @@
         <mxCell id="h_IfcKcDqefbh2okwJfm-1" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E1EEFF99;strokeColor=#91BDFF;dashed=1;dashPattern=12 12;gradientColor=none;fillStyle=auto;fontFamily=Computer Modern;fontSource=https%3A%2F%2Ffonts.googleapis.com%2Fcss%3Ffamily%3DComputer%2BModern;" value="" vertex="1">
           <mxGeometry height="280" width="240" y="160" as="geometry" />
         </mxCell>
-        <mxCell id="h_IfcKcDqefbh2okwJfm-2" parent="1" style="text;html=1;whiteSpace=wrap;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;rounded=0;fontColor=light-dark(#A9C4EB,#90BDFF);fontFamily=Computer Modern;fontSource=https%3A%2F%2Ffonts.googleapis.com%2Fcss%3Ffamily%3DComputer%2BModern;" value="&lt;font style=&quot;font-size: 26px;&quot;&gt;&lt;b style=&quot;&quot;&gt;Frozen CLIP&lt;/b&gt;&lt;/font&gt;" vertex="1">
+        <mxCell id="h_IfcKcDqefbh2okwJfm-2" parent="1" style="text;html=1;whiteSpace=wrap;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;rounded=0;fontColor=light-dark(#A9C4EB,#90BDFF);fontFamily=Computer Modern;fontSource=https%3A%2F%2Ffonts.googleapis.com%2Fcss%3Ffamily%3DComputer%2BModern;" value="&lt;font style=&quot;font-size: 26px;&quot;&gt;&lt;b style=&quot;&quot;&gt;Frozen CLIP❄️&lt;/b&gt;&lt;/font&gt;" vertex="1">
           <mxGeometry height="40" width="240" y="115" as="geometry" />
         </mxCell>
         <mxCell id="h_IfcKcDqefbh2okwJfm-4" parent="1" style="text;html=1;whiteSpace=wrap;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;rounded=0;fontFamily=Computer Modern;fontSource=https%3A%2F%2Ffonts.googleapis.com%2Fcss%3Ffamily%3DComputer%2BModern;" value="&lt;font style=&quot;font-size: 20px;&quot;&gt;&lt;b&gt;source image&lt;/b&gt;&lt;/font&gt;" vertex="1">
@@ -67,7 +67,7 @@
             <mxPoint x="1030" y="300" as="targetPoint" />
           </mxGeometry>
         </mxCell>
-        <mxCell id="eCGb7iw-xjGbBs7QUHqs-18" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fad7ac;strokeColor=#b46504;fontFamily=Computer Modern;fontSource=https%3A%2F%2Ffonts.googleapis.com%2Fcss%3Ffamily%3DComputer%2BModern;" value="&lt;div style=&quot;line-height: 160%;&quot;&gt;&lt;b&gt;&lt;font style=&quot;font-size: 21px; line-height: 160%;&quot;&gt;Cross-Attention&lt;/font&gt;&lt;/b&gt;&lt;/div&gt;" vertex="1">
+        <mxCell id="eCGb7iw-xjGbBs7QUHqs-18" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fad7ac;strokeColor=#b46504;fontFamily=Computer Modern;fontSource=https%3A%2F%2Ffonts.googleapis.com%2Fcss%3Ffamily%3DComputer%2BModern;" value="&lt;div style=&quot;line-height: 150%;&quot;&gt;&lt;b&gt;&lt;font style=&quot;font-size: 21px;&quot;&gt;Cross-Attention&lt;/font&gt;&lt;/b&gt;&lt;/div&gt;&lt;div&gt;&lt;b&gt;&lt;font style=&quot;font-size: 13px;&quot;&gt;\(\mathrm{attended} = \mathrm{Attn}(q{=}v_{ref},\ kv{=}c)\)&lt;/font&gt;&lt;/b&gt;&lt;/div&gt;" vertex="1">
           <mxGeometry height="70" width="218" x="373" y="185" as="geometry" />
         </mxCell>
         <mxCell id="eCGb7iw-xjGbBs7QUHqs-20" parent="1" style="text;html=1;whiteSpace=wrap;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;rounded=0;fontSize=14;fontStyle=1;fontFamily=Computer Modern;fontSource=https%3A%2F%2Ffonts.googleapis.com%2Fcss%3Ffamily%3DComputer%2BModern;" value="keys-values" vertex="1">
@@ -82,13 +82,13 @@
         <mxCell id="eCGb7iw-xjGbBs7QUHqs-39" edge="1" parent="1" source="eCGb7iw-xjGbBs7QUHqs-28" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontFamily=Computer Modern;fontSource=https%3A%2F%2Ffonts.googleapis.com%2Fcss%3Ffamily%3DComputer%2BModern;" target="eCGb7iw-xjGbBs7QUHqs-38">
           <mxGeometry relative="1" as="geometry" />
         </mxCell>
-        <mxCell id="eCGb7iw-xjGbBs7QUHqs-28" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fad7ac;strokeColor=#b46504;fontFamily=Computer Modern;fontSource=https%3A%2F%2Ffonts.googleapis.com%2Fcss%3Ffamily%3DComputer%2BModern;" value="&lt;div style=&quot;line-height: 160%;&quot;&gt;&lt;b&gt;&lt;font style=&quot;font-size: 21px; line-height: 160%;&quot;&gt;Gated&lt;/font&gt;&lt;/b&gt;&lt;div&gt;&lt;div&gt;&lt;b&gt;&lt;font style=&quot;font-size: 14px; line-height: 160%;&quot;&gt;\(q = norm( v_{ref} + g \odot \delta) \)&lt;/font&gt;&lt;/b&gt;&lt;/div&gt;&lt;/div&gt;&lt;/div&gt;" vertex="1">
+        <mxCell id="eCGb7iw-xjGbBs7QUHqs-28" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fad7ac;strokeColor=#b46504;fontFamily=Computer Modern;fontSource=https%3A%2F%2Ffonts.googleapis.com%2Fcss%3Ffamily%3DComputer%2BModern;" value="&lt;div style=&quot;line-height: 150%;&quot;&gt;&lt;b&gt;&lt;font style=&quot;font-size: 21px;&quot;&gt;Gated&lt;/font&gt;&lt;/b&gt;&lt;/div&gt;&lt;div&gt;&lt;b&gt;&lt;font style=&quot;font-size: 14px;&quot;&gt;\(q = norm(v_{ref} + g \odot \delta)\)&lt;/font&gt;&lt;/b&gt;&lt;/div&gt;" vertex="1">
           <mxGeometry height="70" width="196" x="650" y="265" as="geometry" />
         </mxCell>
         <mxCell id="eCGb7iw-xjGbBs7QUHqs-33" parent="1" style="text;html=1;whiteSpace=wrap;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;rounded=0;fontSize=14;fontStyle=1;fontFamily=Computer Modern;fontSource=https%3A%2F%2Ffonts.googleapis.com%2Fcss%3Ffamily%3DComputer%2BModern;" value="fused query" vertex="1">
           <mxGeometry height="30" width="90" x="870" y="270" as="geometry" />
         </mxCell>
-        <mxCell id="eCGb7iw-xjGbBs7QUHqs-34" parent="1" style="text;html=1;whiteSpace=wrap;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;rounded=0;fontColor=light-dark(#A9C4EB,#90BDFF);fontFamily=Computer Modern;fontSource=https%3A%2F%2Ffonts.googleapis.com%2Fcss%3Ffamily%3DComputer%2BModern;" value="&lt;font style=&quot;font-size: 26px; color: light-dark(rgb(180, 101, 4), rgb(255, 181, 112));&quot;&gt;&lt;b style=&quot;&quot;&gt;Trained Module&lt;/b&gt;&lt;/font&gt;" vertex="1">
+        <mxCell id="eCGb7iw-xjGbBs7QUHqs-34" parent="1" style="text;html=1;whiteSpace=wrap;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;rounded=0;fontColor=light-dark(#A9C4EB,#90BDFF);fontFamily=Computer Modern;fontSource=https%3A%2F%2Ffonts.googleapis.com%2Fcss%3Ffamily%3DComputer%2BModern;" value="&lt;font style=&quot;font-size: 26px; color: light-dark(rgb(180, 101, 4), rgb(255, 181, 112));&quot;&gt;&lt;b style=&quot;&quot;&gt;Trained Module🔥&lt;/b&gt;&lt;/font&gt;" vertex="1">
           <mxGeometry height="40" width="240" x="475" y="115" as="geometry" />
         </mxCell>
         <mxCell id="eCGb7iw-xjGbBs7QUHqs-53" edge="1" parent="1" source="eCGb7iw-xjGbBs7QUHqs-38" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;fontFamily=Computer Modern;fontSource=https%3A%2F%2Ffonts.googleapis.com%2Fcss%3Ffamily%3DComputer%2BModern;" target="eCGb7iw-xjGbBs7QUHqs-52">
