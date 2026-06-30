@@ -5,3 +5,5 @@ figures/*.png
 figures/*.pdf
 figures/*.aux
 figures/*.log
+CLAUDE.md
+/paper
