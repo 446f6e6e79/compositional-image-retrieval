@@ -1,22 +1,21 @@
 # Compositional Image Retrieval
 
-The project studies **compositional image retrieval** on CelebA: given a *source image* and a signed textual edit (`+attr` / `−attr`), retrieve gallery images that preserve the source while applying the requested attribute changes. Throughout, the **CLIP ViT-B/32 encoder** [(Radford et al., 2021)](https://arxiv.org/abs/2103.00020) is kept **frozen**, and every method is evaluated on a common benchmark with Recall@K and Precision@K for K ∈ {1, 5, 10}, the source image excluded. 
-
-The task follows the CLIP-based compositional retrieval setting adopted in **CLAY** [(Lim et al., 2026)](https://arxiv.org/abs/2604.11539) and is motivated by recent studies on the compositional structure of vision-language embeddings [(Berasi et al., 2025)](https://openaccess.thecvf.com/content/CVPR2025/html/Berasi_Not_Only_Text_Exploring_Compositionality_of_Visual_Representations_in_Vision-Language_CVPR_2025_paper.html).
+The project studies **compositional image retrieval** on CelebA: given a *source image* and a signed textual edit (`+attr` / `−attr`), the objective is to retrieve gallery images that preserve the source while applying the requested attribute changes.
+This work adopts the CLIP-based compositional retrieval setting introduced in **CLAY** [(Lim et al., 2026)](https://arxiv.org/abs/2604.11539), utilizing a **frozen CLIP encoder** [(Radford et al., 2021)](https://arxiv.org/abs/2103.00020).
 
 ## Contributions
 
-In this project, we investigate how to overcome the **static multi-condition fusion** of **CLAY** [(Lim et al., 2026)](https://arxiv.org/abs/2604.11539). CLAY performs efficient, training-free conditional retrieval by decoupling textual conditioning from visual feature extraction: for a given condition it builds a textual subspace and retrieves by projecting the frozen visual features onto it, so database features are never re-encoded when the condition changes. Multiple conditions are merged into a single static projection subspace that weights every condition uniformly. Crucially, CLAY models only *positive, focus-on* conditions: it has no notion of **signed** (additive/subtractive) attributes and no per-query mechanism to resolve multiple, let alone competing, conditions. Our work targets exactly this gap, learning a query-dependent fusion of signed `+`/`−` conditions.
+In this project, we investigate how to overcome the **static multi-condition fusion** of **CLAY** [(Lim et al., 2026)](https://arxiv.org/abs/2604.11539). CLAY enables efficient, training-free retrieval by separating text conditioning from visual features. It achieves this by projecting frozen visual features onto a textual subspace constructed for each condition. Multiple conditions are then merged into a single static subspace that weights every condition uniformly. Crucially, CLAY only supports positive, additive conditions; it lacks a mechanism for signed (additive or subtractive) attributes and cannot resolve multiple or competing conditions for a single query.
 
-The report follows an ablation narrative in which each training-free method upgrades **exactly one thing** over its predecessor:
+We propose the following training-free methods for compositional image retrieval:
 
-- **Baseline** - a zero-shot, training-free starting point using raw embedding-space arithmetic on the frozen CLIP ViT-B/32 encoder [(Radford et al., 2021)](https://arxiv.org/abs/2103.00020). It exposes the structural limits of this arithmetic: the source image leaks unwanted traits into the query, and vector subtraction fails to capture true semantic negation.
-- **Source-Attribute Matching** - upgrades the *fusion mechanism*, replacing embedding arithmetic with explicit per-attribute comparison against the source in a calibrated similarity space.
-- **Prompt Ensembling** - upgrades only the *text bank*, leaving the scorer untouched, with an article-free adaptation of CLIP's ImageNet prompt ensemble.
+- **Baseline**: a zero-shot, training-free starting point using raw embedding-space arithmetic on the frozen CLIP ViT-B/32 encoder [(Radford et al., 2021)](https://arxiv.org/abs/2103.00020).
+- **Source-Attribute Matching**: upgrades the *fusion mechanism*, replacing embedding arithmetic with explicit per-attribute comparison against the source in a calibrated similarity space.
+- **Prompt Ensembling**: upgrades only the *text bank*, leaving the scorer untouched, with an article-free adaptation of CLIP's ImageNet prompt ensemble.
 
-Before settling on a trained model, we also built and discarded two *learned* alternatives - prompt optimization via **CoOp** [(Zhou et al., 2022)](https://arxiv.org/abs/2109.01134) and concept editing via **Sparse Autoencoders** [(Gao et al., 2024)](https://arxiv.org/abs/2406.04093) - neither of which resolved the multi-condition fusion problem.
+Before settling on a trained model, we also built and discarded two *learned* alternatives: prompt optimization via **CoOp** [(Zhou et al., 2022)](https://arxiv.org/abs/2109.01134) and concept editing via **Sparse Autoencoders** [(Gao et al., 2024)](https://arxiv.org/abs/2406.04093) - neither of which showed improvement over the multi-condition fusion problem.
 
-Our main contribution, **Cross-Attention Fusion**, is the only trained method. Instead of statically combining condition embeddings before retrieval, it *learns* a query-dependent interaction between the reference image and its sequence of signed textual conditions [(Vaswani et al., 2017)](https://arxiv.org/abs/1706.03762), so each condition is weighted per image rather than uniformly as in CLAY.
+Our main contribution, **Cross-Attention Fusion**, addresses this by dynamically modeling the interaction between the reference image and its sequence of signed textual conditions via cross-attention [(Vaswani et al., 2017)](https://arxiv.org/abs/1706.03762). Rather than statically combining condition embeddings prior to retrieval, this approach computes image-conditioned weights for each attribute, moving past the uniform, static weighting used in CLAY.
 
 ---
 
@@ -32,7 +31,7 @@ The dataset is **CelebA** [(Liu et al., 2015)](https://arxiv.org/abs/1411.7766),
 
 We use **CLIP** (ViT-B/32) as a **frozen** feature extractor, encoding every image into a fixed 512-d vector [(Radford et al., 2021)](https://arxiv.org/abs/2103.00020). Since these embeddings never change, we precompute them offline once.
 
-All embeddings are L2-normalized to unit vectors at extraction time. Similarity between a query $\mathbf{q}$ and a gallery vector $\mathbf{g}$ is then a plain dot product,
+All embeddings are L2-normalized to unit vectors at extraction time. Similarity between a query $\mathbf{q}$ and a gallery vector $\mathbf{g}$ is then a plain dot product:
 
 $$\text{similarity}(\mathbf{q}, \mathbf{g}) = \mathbf{q} \cdot \mathbf{g},$$
 
@@ -42,7 +41,7 @@ Retrieval over the whole gallery is therefore a single matrix multiplication rat
 
 ## Embedding Analysis: Class-Image Similarity
 
-Before constructing the retrieval model, we first assess how well CLIP distinguishes the 40 CelebA attributes. For each attribute, we select a *prototype* image containing the target attribute while minimizing co-occurring traits, then compute a \(40 \times 40\) cosine similarity matrix between the image embeddings and the 40 attribute text prompts. If CLIP were well aligned with these concepts, the diagonal would dominate each row; strong off-diagonal responses would instead indicate confusion between related attributes such as `Wavy_Hair` and `Straight_Hair`.
+Before constructing the retrieval model, we first assess how well CLIP distinguishes the 40 CelebA attributes. For each attribute, we select a *prototype* image containing the target attribute while minimizing co-occurring traits, then compute a \(40 \times 40\) cosine similarity matrix between the image embeddings and the 40 attribute text prompts.
 
 The diagonal is not dominant. Instead, the matrix is driven by row and column biases, with some prompts and images scoring consistently highly across unrelated pairs. Moreover, all cosine similarities fall within a narrow range (approximately \(0.13\)–\(0.27\)), providing little discriminative signal. Raw CLIP cosine similarity therefore captures broad facial semantics rather than the fine-grained attribute information required for reliable retrieval.
 
@@ -63,14 +62,14 @@ Both metrics are first averaged over the source images of each query (reported w
 ---
 
 ## Evaluation Protocol
+
 To assess the performance of our retrieval system, we utilize a standardized benchmark of queries stored in a JSON file. Each entry in the dataset follows this structure:
 
 * **`query`**: A string representing the textual modification (e.g., `"+glasses, -smiling"`).
-* **`ground_truth`**: A dictionary where:
-    * **Keys** are the indices of the **source images** used as the starting point.
-    * **Values** are lists of indices for images considered valid retrievals for that specific source.
+* **`ground_truth`**: A dictionary mapping source image indices to lists of valid target image indices.
 
 ### Example Structure
+
 ```json
 {
     "query": "+glasses, -smiling",
@@ -79,114 +78,83 @@ To assess the performance of our retrieval system, we utilize a standardized ben
         "4": [5, 6, 7]
     }
 }
+
 ```
-In this example, image 0 serves as a source image (e.g., a smiling person without glasses). The system is expected to retrieve images 1, 2, or 3, which represent the "target" state (a non-smiling person with glasses), which should be visually similar to the source image but with the specified modifications applied.
 
-### Formal validity rule
+In this example, image `0` is the source (e.g., a smiling person without glasses). The system must retrieve images `1`, `2`, or `3`, which represent the modified target state (not smiling, with glasses).
 
-Fix a source image $s$ with binary attribute vector $\mathbf{b}_s \in \{0,1\}^{40}$ and a signed query $q=(q^+,q^-)$, where $q^+$ / $q^-$ are the attributes to add / remove. The **ideal target attribute vector** $\mathbf{b}^\star$ is $\mathbf{b}_s$ with the queried bits set to their requested values:
-$$\mathbf{b}^\star_j=\begin{cases}1 & j\in q^+\\ 0 & j\in q^-\\ (\mathbf{b}_s)_j & \text{otherwise.}\end{cases}$$
-An image $x$ is a **valid retrieval** for $(s,q)$ iff it satisfies every signed constraint **and** stays within a Hamming budget of the ideal attribute vector:
-$$\mathcal{G}(s,q)=\Big\{\,x:\ (\mathbf{b}_x)_j=1\ \forall j\in q^+,\ \ (\mathbf{b}_x)_j=0\ \forall j\in q^-,\ \ \lVert\mathbf{b}_x-\mathbf{b}^\star\rVert_1\le 2\,\Big\}.$$
-This set $\mathcal{G}$ is exactly the ground-truth set used by $\text{Recall@}K$ and $\text{Precision@}K$ above. The Hamming-$\le 2$ budget keeps a valid target visually close to the source: only the requested edits, plus at most two incidental attribute changes.
+### Ground Truth Validity Criteria
+
+An image is considered a valid retrieval for a given source and query if it meets two conditions:
+
+1. **Strict Attribute Matching:** It must perfectly satisfy the explicit edits requested in the query (e.g., it *must* have glasses and *must not* be smiling).
+2. **Visual Consistency:** To ensure the target image remains visually close to the source, we enforce a strict threshold allowing a maximum of **two incidental attribute changes** outside of the requested query.
 
 ---
 
 ## Baseline Method
-To establish a baseline for our retrieval system, we evaluate a **zero-shot, training-free approach** that relies exclusively on CLIP embeddings and cosine similarity.
 
-The baseline uses simple latent space arithmetic by combining the attribute and image embeddings, without any learning or explicit alignment.
-The query is decomposed into signed attribute terms: starting from the source image embedding, each `+` attribute embedding is added and each `−` attribute embedding is subtracted, and the resulting vector is used to find the nearest neighbours in the dataset.
+To establish a baseline, we evaluate a **zero-shot, training-free approach** that relies on simple latent space arithmetic using pre-computed CLIP embeddings.
 
-### Scorer
+Starting from the source image embedding, we add the embeddings of the requested attributes (`+`) and subtract the embeddings of the removed attributes (`−`). The resulting vector is then used to find the nearest neighbors in the dataset via cosine similarity.
 
-Let $\mathbf{v}_s \in \mathbb{R}^D$ represent the raw CLIP visual embedding of the source image, and let $\hat{\mathbf{e}}_s = \frac{\mathbf{v}_s}{\|\mathbf{v}_s\|_2}$ be its corresponding unit-norm vector. For each text attribute $j$, $\mathbf{t}_j \in \mathbb{R}^D$ denotes the raw CLIP text embedding generated from the bare-name attribute prompt.
-
-Let $q^+$ be the set of attributes to be added, and $q^-$ be the set of attributes to be removed. The unnormalized composite query vector $\mathbf{f} \in \mathbb{R}^D$ is constructed by shifting the source embedding along the text vector directions:
+Let $\mathbf{v}_s$ be the raw CLIP visual embedding of the source image, and $\mathbf{t}_j$ be the raw CLIP text embedding for attribute $j$. Given the sets of attributes to add ($q^+$) and remove ($q^-$), the unnormalized composite query vector $\mathbf{f}$ is:
 
 $$\mathbf{f} = \mathbf{v}_s + \sum_{j \in q^+} \mathbf{t}_j - \sum_{j \in q^-} \mathbf{t}_j$$
 
-To evaluate and rank candidate images from the gallery, we compute the cosine similarity between the composite query and each gallery embedding. Let $\hat{\mathbf{e}}_x$ represent the pre-normalized, unit-norm CLIP embedding of a gallery image $x$ (where $\|\hat{\mathbf{e}}_x\|_2 = 1$). The final retrieval score for a given candidate $x$ is defined as the inner product of $\hat{\mathbf{e}}_x$ and the unit-normalized query vector:
+### Scorer
+
+To rank candidate images from the gallery, we normalize the composite query vector and compute its cosine similarity (inner product) with each unit-normalized gallery embedding $\hat{\mathbf{e}}_x$:
 
 $$\text{score}(x) = \hat{\mathbf{e}}_x^{\top} \left( \frac{\mathbf{f}}{\|\mathbf{f}\|_2} \right)$$
 
-Gallery images are then sorted in descending order based on this score, directly optimizing the retrieval ranking in the shared latent space.
-
 ## Source-Attribute Matching (Training-Free)
 
-The baseline model composes raw embeddings by summing text and image vectors directly in CLIP space. This approach introduces two critical structural problems:
+The baseline approach introduces two critical structural problems:
 
-1. **Source Leakage:** The raw image embedding implicitly injects *every* attribute of the source person - including those the query explicitly requests to change. This biases the retrieval heavily toward exact look-alikes of the source.
-2. **Embedding-Space Negation:** Subtracting an attribute embedding (i.e., $- \mathbf{t}_j$) does not project into a region that represents the true linguistic complement of that concept in CLIP space.
+1. **Source Leakage:** The raw image embedding implicitly contains every visual attribute of the original person, including those the query explicitly requests to change. As a result, the system is heavily biased toward retrieving exact look-alikes of the source image rather than successfully applying the modifications.
+2. **Embedding-Space Negation:** Subtracting an attribute embedding does not project into a region that represents the true linguistic complement of that concept in CLIP space.
 
-To overcome these limitations, **Source-Attribute Matching (SAM)** utilizes the same core components (text and image cosine similarities) but fundamentally recasts the composition inside a **per-attribute similarity space**. This design is mathematically aligned with the ground-truth evaluation rules of the CelebA benchmark, where a valid target must satisfy the query's signed constraints while remaining within a **Hamming distance of $\le 2$** from the source image's 40-bit attribute vector.
+To overcome these limitations, **Source-Attribute Matching (SAM)** utilizes the same core components (text and image cosine similarities) but fundamentally recasts the composition inside a **per-attribute similarity space**:
 
-Instead of manipulating an opaque, high-dimensional visual vector, SAM explicitly breaks down image composition into localized attribute agreements:
+* **Per-Attribute Logits:** Every gallery image is compared against a text bank of all attributes. This creates a matrix where each entry represents the direct cosine similarity between a specific image and a specific trait.
+* **Statistical Calibration (Z-Scoring):** To prevent dominant traits from overpowering the representation, we **z-score normalize** each attribute column independently. This centers each trait's distribution around a mean of 0 and a standard deviation of 1, placing all concepts on a comparable scale.
+* **Explicit Decomposed Scoring:** The source image's row in the calibrated matrix serves as its semantic profile. Candidates are then evaluated using a scoring objective that balances three goals: satisfying the explicit query, preserving unmentioned background traits, and maintaining global visual identity.
 
-* **Per-Attribute Logits:** We map every gallery image against an explicit text bank consisting of one naturalized prompt per attribute. This yields a raw similarity matrix where each entry represents the cosine similarity between a specific image and a specific facial trait.
-* **Statistical Calibration (Z-Scoring):** Raw CLIP cosine similarities suffer from severe alignment discrepancies; certain prominent attributes exhibit uniformly high means across the dataset, while subtle ones remain low. To prevent high-variance or high-mean attributes from dominating the retrieval process, we apply **z-score normalization** independently to each attribute column. This statistical calibration centers each attribute's distribution around a mean of 0 and scales it to a standard deviation of 1, placing all 40 semantic concepts onto an identical, comparable scale.
-* **Explicit Decomposed Scoring:** The source image's own row within this calibrated matrix acts as its semantic profile. Candidates are evaluated using a multi-term objective balancing query adherence, background attribute preservation, and global visual identity.
-
-By shifting the operations to a calibrated similarity space, negation is handled by simply inverting a normalized score rather than subtracting vectors in a latent space, completely resolving both baseline limitations.
+By shifting operations to this calibrated similarity space, negation is handled by simply inverting a normalized score rather than subtracting vectors in latent space, resolving both baseline limitations.
 
 ### Scorer
 
-Let $L \in \mathbb{R}^{N \times 40}$ be the raw attribute logit matrix, where $N$ is the total number of gallery images. The element $L_{xj}$ represents the single-prompt cosine similarity between the unit-norm embedding of gallery image $x$ ($\hat{\mathbf{e}}_x$) and the text embedding of attribute $j$ ($\mathbf{t}_j$):
-
-$$L_{xj} = \hat{\mathbf{e}}_x^{\top}\mathbf{t}_j$$
-
-We apply column-wise z-scoring across the entire gallery to construct the calibrated similarity matrix $Z \in \mathbb{R}^{N \times 40}$. For an image $x$ and attribute $j$, the calibrated score $Z_{xj}$ is defined as:
-
-$$Z_{xj} = \frac{L_{xj} - \mu_j}{\sigma_j}$$
-
-where the dataset-wide mean $\mu_j$ and standard deviation $\sigma_j$ for attribute $j$ are computed as:
-
-$$\mu_j = \frac{1}{N}\sum_{x=1}^{N} L_{xj}, \qquad \sigma_j = \sqrt{\frac{1}{N}\sum_{x=1}^{N} (L_{xj} - \mu_j)^2}$$
-
-Given a source image $s$ and a signed query $q$, the final retrieval score for any candidate gallery image $x$ is formalized as:
+Given a source image $s$ and a signed query $q$, the retrieval score for any candidate gallery image $x$ is defined by a multi-part objective that balances query compliance, background preservation, and global visual identity:
 
 $$\text{score}(x) = \underbrace{w_q \sum_{j \in q} s_j Z_{xj}}_{\text{Queried Constraints}} \;-\; \underbrace{w_r \sum_{j \notin q} \big(Z_{xj} - Z_{sj}\big)^2}_{\text{Attribute Proximity}} \;+\; \underbrace{w_v \hat{\mathbf{e}}_x^{\top}\hat{\mathbf{e}}_s}_{\text{Visual Similarity}}$$
 
 The operational mechanics of these three components are defined as follows:
 
-* **Queried Constraints:** Evaluates candidate compliance for attributes targeted by the edit. The sign modifier $s_j$ is set to $+1$ if the attribute is requested ($j \in q^+$) and $-1$ if it is to be removed ($j \in q^-$).
-* **Attribute Proximity:** Acts as a continuous surrogate for the benchmark's strict Hamming-$\le 2$ budget. It penalizes any semantic drift on the unqueried background attributes, forcing the retriever to preserve the source identity's secondary traits.
-* **Visual Similarity:** Computes the raw visual cosine similarity between the candidate ($\hat{\mathbf{e}}_x$) and source ($\hat{\mathbf{e}}_s$) embeddings to retain fine-grained spatial characteristics like pose, lighting, and ambient context.
-
-The structural hyperparameters $(w_q, w_r, w_v)$ are static scalar weights optimized via grid search on a validation split to balance the three retrieval priorities.
-
-The three weights `w_query`, `w_attr`, `w_visual` are training-free hyperparameters tuned with a
-deliberately small grid so sensitivity stays visible. They are tuned **once**, using the simple
-bare-name attribute bank (Source-Attribute Matching); Prompt Ensembling reuses the same `PM_WEIGHTS` with its
-improved bank, making the two methods directly comparable.
+* **Queried Constraints ($w_q$):** This drives the requested edits. It rewards candidate images that match the new query; either by looking for high positive scores when adding a trait, or high negative scores when removing one. Because we are using calibrated trait scores, removing a feature is as simple as flipping a mathematical sign.
+* **Attribute Proximity ($w_r$):** This acts as a protective shield for the rest of the person's face. It penalizes any changes to the background traits that the query didn't mention, ensuring that unedited features (like hair color, age, or expression) stay as close to the original source image as possible.
+* **Visual Similarity ($w_v$):** This preserves the overall look and feel of the original image using raw CLIP embeddings. It captures fine-grained details that text descriptions miss entirely.
 
 ---
 
-## Prompt Ensembling (training-free)
+## Prompt Ensembling (Training-free)
 
-Source-Attribute Matching fixed the **fusion mechanism**; its remaining weakness is the **text embeddings themselves**: a single bare prompt per attribute is a noisy estimate of the concept. Prompt Ensembling keeps the scoring layer **and the very same weights** frozen, and upgrades only the per-attribute bank:
+While Source-Attribute Matching improves the fusion mechanism, a single text prompt per attribute remains a noisy estimate of a concept. **Prompt Ensembling** addresses this by upgrading the text bank.
 
-- **3a. Expanded template bank.** Each attribute's positive embedding `e⁺` is the ensemble of several person-referring phrases run through an article-free adaptation of CLIP's ImageNet prompt set (55 unique templates) plus a handful of portrait-specific templates.
-- **3b. Linguistic negatives.** A separate `e⁻` is built from real negative descriptions ("a person without {attr}", "a clean-shaven person", ...). The attribute logit becomes the **pos-minus-neg margin** `cos(x, e⁺) − cos(x, e⁻)`, a stronger, noise-cancelled signal than a single positive cosine, and a real linguistic complement instead of a sign flip.
+Instead of relying on a single word, each trait is defined by combining a bank of descriptive phrases with dozens of prompt templates. We average these combinations to create two distinct, well-rounded CLIP profiles for every trait: a **positive profile** capturing its presence, and a **negative profile** capturing its explicit absence.
+The benefits of this approach are twofold:
 
-Because the fusion mechanism and its weights are inherited unchanged from Source-Attribute Matching, any improvement here is attributable to the embedding bank alone.
-
-
-**Formal definition.** For attribute $j$, let $P^+_j$ / $P^-_j$ be its positive / negative phrase banks and $\mathcal{T}$ the template set. Each ensembled embedding L2-normalises every phrase$\times$template encoding before mean-pooling, then re-normalises:
-$$\mathbf{e}^{\pm}_j=\operatorname{normalise}\!\Big(\tfrac{1}{|P^{\pm}_j|\,|\mathcal{T}|}\!\!\sum_{p\in P^{\pm}_j}\sum_{\rho\in\mathcal{T}}\operatorname{normalise}\big(\text{CLIP}_{\text{text}}(\rho(p))\big)\Big).$$
-The per-attribute logit fed to the **unchanged** attribute-matching scorer becomes a pos-minus-neg cosine margin:
-$$L_{xj}=\hat{\mathbf{e}}_x^{\top}\mathbf{e}^{+}_j-\hat{\mathbf{e}}_x^{\top}\mathbf{e}^{-}_j=\cos(\hat{\mathbf{e}}_x,\mathbf{e}^{+}_j)-\cos(\hat{\mathbf{e}}_x,\mathbf{e}^{-}_j),$$
-a noise-cancelled signal whose negative pole is a real linguistic complement rather than a sign flip. Everything downstream ($Z$, the three-term score, the weights) is identical to Source-Attribute Matching, so any gain is attributable to the bank alone.
+* **Noise Cancellation:** Averaging across dozens of prompt templates smooths out the linguistic quirks and inherent noise of individual prompts, establishing a stable baseline.
+* **True Semantic Negation:** Rather than relying on simple arithmetic inversion, this approach uses a dedicated linguistic negative embedding.
 
 ### Scorer
 
-Only the bank changes: Prompt Ensembling builds an **ensembled** pos/neg bank and feeds it to **Source-Attribute Matching's `attribute_matching_scorer`, unchanged**. Any gain over Source-Attribute Matching is therefore attributable to the embedding bank alone.
+To evaluate this method, only the embedding bank is modified, which it's passed directly to the Source-Attribute Matching framework.
 
 #### CLIP ImageNet prompt templates
 
 The per-attribute banks are ensembled over [CLIP's official ImageNet prompt templates](https://github.com/openai/CLIP/blob/main/notebooks/Prompt_Engineering_for_ImageNet.ipynb) (the canonical 80-template zero-shot set), plus a few portrait-specific templates for CelebA faces.
 
-We adapt the templates to **full noun phrases**: each `{phrase}` already carries its own article (e.g. *"a person with glasses"*), so we drop the template's leading article to avoid *"a **a** person with glasses"*. Removing that article makes the `a {}` and `the {}` variants identical, collapsing the official 80 templates to **55 unique** ones, the set we actually ensemble over.
 
 ---
 
