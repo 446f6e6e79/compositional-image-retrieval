@@ -2092,6 +2092,19 @@ else:
     history = {"step": [], "loss": [], "epoch_step": [], "val_loss": [], "best_epoch": -1}
     step = 0
 
+    def _save_ca_checkpoint():
+        """Persist the current best checkpoint to CA_CKPT.
+
+        Called on every validation improvement (not just once at the end) so a Colab
+        crash mid-training loses at most the epochs since the last improvement, not
+        the whole run.
+        """
+        torch.save(
+            {"state_dict": {k: v.cpu() for k, v in best_ca_state.items()},
+             "val_loss": best_val_loss, "history": history},
+            CA_CKPT,
+        )
+
     # Baseline validation loss at step 0 (untrained model): plotted, but not a checkpoint candidate.
     history["epoch_step"].append(0)
     history["val_loss"].append(ca_val_loss())
@@ -2119,6 +2132,7 @@ else:
         if val_loss < best_val_loss:
             best_val_loss, best_epoch = val_loss, len(history["val_loss"]) - 1
             best_ca_state = {k: v.detach().clone() for k, v in ca_model.state_dict().items()}
+            _save_ca_checkpoint()
         history["best_epoch"] = best_epoch
 
         # Live, in-place redraw of the learning curve so training state is visible as it runs.
@@ -2132,11 +2146,7 @@ else:
     clear_output(wait=True)
     plot_training_curve(history)
     print(f"Best val loss: {best_val_loss:.4f} (epoch {best_epoch})")
-    torch.save(
-        {"state_dict": {k: v.cpu() for k, v in best_ca_state.items()},
-         "val_loss": best_val_loss, "history": history},
-        CA_CKPT,
-    )
+    _save_ca_checkpoint()  # final history (post-loop) may differ from the last improvement's save
     print(f"Saved cross-attention to {CA_CKPT}")
 
 
