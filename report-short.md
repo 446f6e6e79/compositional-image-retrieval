@@ -41,7 +41,7 @@ Retrieval over the whole gallery is therefore a single matrix multiplication rat
 
 ## Embedding Analysis: Class-Image Similarity
 
-Before constructing the retrieval model, we first assess how well CLIP distinguishes the 40 CelebA attributes. For each attribute, we select a *prototype* image containing the target attribute while minimizing co-occurring traits, then compute a \(40 \times 40\) cosine similarity matrix between the image embeddings and the 40 attribute text prompts.
+Before constructing the retrieval model, we first assess how well CLIP distinguishes the 40 CelebA attributes. For each attribute, we select a "pure" image: one that has the attribute active while minimizing co-occurring traits, breaking ties at random. We then compute a \(40 \times 40\) cosine similarity matrix between the image embeddings and the 40 attribute text prompts.
 
 The diagonal is not dominant. Instead, the matrix is driven by row and column biases, with some prompts and images scoring consistently highly across unrelated pairs. Moreover, all cosine similarities fall within a narrow range (approximately \(0.13\)–\(0.27\)), providing little discriminative signal. Raw CLIP cosine similarity therefore captures broad facial semantics rather than the fine-grained attribute information required for reliable retrieval.
 
@@ -190,7 +190,7 @@ The rest of this section derives these four stages - **sign-aware FiLM**, **patc
 
 **How the Transformer maps to our problem.** The sequence the attention runs over is neither image patches nor text sub-words: it is the query's own short list of `±attribute` edits (one to three of them), so the sequence length is simply *how many things you asked to change*. The **source image is the single query token** ($Q$), while the **sign-modulated condition vectors are the keys and values** ($K=V$). Read semantically, the image asks *"given who I am, how strongly should I weigh each requested edit?"* - and because there is exactly one query token, the output is a content-based weighted average of the conditions, with the weights computed from the image itself, which is exactly the per-image weighting the fixed-rule methods cannot express.
 
-At a high level (diagram below), frozen CLIP encodes the source image into a unit-norm embedding $\mathbf{v}_{\text{ref}}$ **and** its sequence of visual tokens $[\text{CLS};\,49\text{ patches}]$, and each condition into the bare-name text vector $\mathbf{t}_a$ of its attribute; the trained module $\Phi_\theta$ fuses them into a single query $\mathbf{q}$, which ranks the frozen gallery by cosine similarity.
+At a high level (diagram below), frozen CLIP encodes the source image into a unit-norm embedding $\mathbf{v}_{\text{ref}}$ **and** its sequence of visual tokens - CLIP's global **CLS** summary of the whole image together with its 49 spatial patch tokens - and each condition into the bare-name text vector $\mathbf{t}_a$ of its attribute; the trained module $\Phi_\theta$ fuses them into a single query $\mathbf{q}$, which ranks the frozen gallery by cosine similarity.
 
 ![High-level architecture of the cross-attention fusion module](figures/architecture.svg)
 

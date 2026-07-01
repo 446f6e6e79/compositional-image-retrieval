@@ -51,7 +51,7 @@ This is a report, and the ablation story is part of it. When adding or moving a 
 
 - Keep **all training-free methods before all training-based methods**.
 - Each training-free step must read as a *single upgrade* over the one before it (fusion, then bank, etc.); do not reorder so a later method changes two things at once.
-- Keep cross-block dependencies one-directional: training-based cells may consume training-free outputs (e.g. `Z_ENS`, `E_POS`/`E_NEG`, `ATTR_TEXT_EMBS`), never the reverse.
+- Keep cross-block dependencies one-directional: training-based cells may consume training-free outputs (e.g. `Z_ENS`, `E_POS`/`E_NEG`, `get_attribute_text_embeddings()`), never the reverse.
 - The author edits cells between sessions - **re-read a cell before patching it** rather than assuming its current contents.
 
 ## Conventions

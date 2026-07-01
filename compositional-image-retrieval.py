@@ -1,5 +1,16 @@
 #==============================================================================
-# Cell   9 [code] - CLIP model & encoding helpers (get_CLIP_model, encode_texts)
+# Cell   8 [code] - Global paths (dataset root, benchmark annotations, embedding cache)
+#==============================================================================
+
+# Do *not* append `celeba/` to CELEBA_ROOT, the dataset class does that itself
+CELEBA_ROOT = Path("/content/datasets")
+BENCHMARK_ANNOTATIONS_PATH = Path("/content/drive/MyDrive/datasets/celeba_evaluation.json")
+EVALUATION_CACHE_DIR = "/content/drive/MyDrive/datasets/clip_cache"
+EVALUATION_CACHE_PATH = os.path.join(EVALUATION_CACHE_DIR, "embeddings.pt")
+
+
+#==============================================================================
+# Cell  10 [code] - CLIP model & encoding helpers (get_CLIP_model, encode_texts)
 #==============================================================================
 
 MODEL_NAME = "openai/clip-vit-base-patch32"
@@ -14,10 +25,12 @@ def get_CLIP_model():
         The cached (model, processor) pair, with the model on `device` and in eval mode.
     """
     global _model, _processor
+    
     if _model is None:
         print("Loading CLIP model...")
         _model = CLIPModel.from_pretrained(MODEL_NAME).to(device)
         _model.eval()
+
     if _processor is None:
         _processor = CLIPProcessor.from_pretrained(MODEL_NAME)
     return _model, _processor
@@ -62,47 +75,67 @@ def encode_texts(prompts: list[str], device) -> torch.Tensor:
     return F.normalize(embs, p=2, dim=-1)
 
 def _collate_keep_pil(batch):
-    """Collate a batch by keeping PIL images as a list and stacking the labels.
+    """
+    Custom collate function for a PyTorch DataLoader that preserves images as
+    PIL.Image objects while batching the corresponding labels.
 
-    The default collate_fn cannot stack PIL.Image objects, and the encode loop
-    wants a list of PIL images to feed to the CLIP processor.
+    Unlike PyTorch's default ``collate_fn``, this function does not attempt to
+    convert or stack the images into a tensor. Instead, it returns the images
+    as a Python list, allowing downstream code (e.g., a CLIP processor) to
+    perform its own preprocessing. The labels are stacked along the first
+    dimension to form a batched tensor.
 
     Args:
-        batch: List of (PIL image, label tensor) pairs.
+        batch (list[tuple[PIL.Image.Image, torch.Tensor]]):
+            A list of samples produced by the dataset, where each sample is a
+            ``(image, label)`` tuple. The image is a PIL Image and the label is
+            a tensor.
 
     Returns:
-        A (list of PIL images, stacked label tensor) pair.
+        tuple[list[PIL.Image.Image], torch.Tensor]:
+            A tuple containing:
+                - A list of PIL images in the same order as the input batch.
+                - A tensor containing the stacked labels with shape ``(batch_size, ...)``.
     """
     imgs = [item[0] for item in batch]
     lbls = torch.stack([item[1] for item in batch], dim=0)
     return imgs, lbls
 
-@torch.no_grad()
-def _encode_image_batches(
+def _encode_dataset(
     dataset,
     device,
     encode_batch: Callable,
+    out_shape: tuple[int, ...],
+    out_dtype: torch.dtype,
     indices: list[int] | None = None,
     batch_size: int = 64,
     num_workers: int = 4,
-):
-    """Yield per-batch CLIP encodings for a dataset (optionally a subset).
+    keep_labels: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Encode a dataset with CLIP in one DataLoader pass, with progress logging.
 
     Args:
         dataset: Dataset yielding (image, label) pairs.
         device: Device the CLIP forward runs on.
         encode_batch: Callable (model, inputs) -> (B, ...) CPU tensor, where `inputs` is the
-            CLIP processor output for the batch, already moved to `device`.
+            CLIP processor output for the batch, already moved to `device`. The per-sample
+            shape/dtype of this output must match `out_shape`/`out_dtype`.
+        out_shape: Per-sample output shape (excluding the batch dim), e.g. (D,) for pooled
+            embeddings or (50, 768) for patch tokens. Must match what `encode_batch` returns.
+        out_dtype: Output dtype, e.g. torch.float32 or torch.float16. Must match what
+            `encode_batch` returns.
         indices: Optional subset of dataset indices to encode, in order. None encodes all.
         batch_size: DataLoader batch size.
         num_workers: DataLoader worker count.
+        keep_labels: Whether to also accumulate and return labels.
 
-    Yields:
-        (encoded_batch, labels_batch) pairs, one per DataLoader batch.
+    Returns:
+        An (encoded, labels) pair: encoded is (N, *out_shape) on CPU; labels is the (N, ...)
+        concatenation of the dataset labels if `keep_labels`, else None.
     """
     model, processor = get_CLIP_model()
     source = dataset if indices is None else torch.utils.data.Subset(dataset, list(indices))
-
+    # Use a buffered data loader
     loader = torch.utils.data.DataLoader(
         source,
         batch_size=batch_size,
@@ -112,86 +145,41 @@ def _encode_image_batches(
         collate_fn=_collate_keep_pil,
     )
 
-    for imgs_batch, lbls_batch in loader:
-        inputs = processor(images=imgs_batch, return_tensors="pt").to(device)
-        yield encode_batch(model, inputs), lbls_batch
-
-def _encode_pooled_batch(model, inputs) -> torch.Tensor:
-    """Encode a batch of prepared CLIP inputs into pooled, projected, L2-normalized image embeddings.
-
-    Args:
-        model: The CLIP model returned by get_CLIP_model().
-        inputs: Processor output for the batch (e.g. pixel_values), already moved to device.
-
-    Returns:
-        A (B, D) CPU tensor, L2-normalized per row.
-    """
-    e = _as_feature_tensor(model.get_image_features(**inputs))
-    return F.normalize(e, p=2, dim=-1).cpu()
-
-
-def _encode_token_batch(model, inputs) -> torch.Tensor:
-    """Encode a batch of prepared CLIP inputs into the raw per-token visual sequence ``[CLS ; 49 patch]``.
-
-    Args:
-        model: The CLIP model returned by get_CLIP_model().
-        inputs: Processor output for the batch (e.g. pixel_values), already moved to device.
-
-    Returns:
-        A (B, 50, 768) fp16 CPU tensor, not L2-normalized.
-    """
-    return model.vision_model(pixel_values=inputs["pixel_values"]).last_hidden_state.half().cpu()
-
-def _collect_encoded(
-    batches, n_total: int, keep_labels: bool
-) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Stream-accumulate encoded batches into one preallocated CPU tensor, with progress logging.
-
-    Args:
-        batches: Iterable of (encoded_batch, labels_batch) pairs, e.g. from _encode_image_batches.
-        n_total: Total number of rows across all batches, for preallocation and progress.
-        keep_labels: Whether to also accumulate and return labels.
-
-    Returns:
-        An (encoded, labels) pair: encoded is (n_total, ...) on CPU; labels is the (n_total, ...)
-        concatenation of the label batches if `keep_labels`, else None.
-    """
-    encoded = None
-    labels_list: list[torch.Tensor] = []
+    n_total = len(source)
     pad = len(str(n_total))
     pos = 0
-    for batch, lbls in batches:
-        if encoded is None:
-            encoded = torch.empty((n_total, *batch.shape[1:]), dtype=batch.dtype)
+
+    encoded = torch.empty((n_total, *out_shape), dtype=out_dtype)
+    labels_list: list[torch.Tensor] = []
+    # Iterate over the DataLoader, encoding each batch and accumulating results
+    for imgs_batch, lbls_batch in loader:
+        inputs = processor(images=imgs_batch, return_tensors="pt").to(device)
+        batch = encode_batch(model, inputs)
         encoded[pos:pos + batch.shape[0]] = batch
         if keep_labels:
-            labels_list.append(lbls)
+            labels_list.append(lbls_batch)
         pos += batch.shape[0]
         print(f"Encoded {pos:>{pad}}/{n_total} images ({100 * pos / n_total:.1f}%)")
 
     labels = torch.cat(labels_list, dim=0) if keep_labels else None
     return encoded, labels
 
-
 def _load_or_encode(
     cache_path: str,
     encode_pass: Callable,
     *,
-    is_fresh: Callable = lambda blob: True,
     from_cache: Callable = lambda blob: blob,
 ):
-    """Load cached data from `cache_path` if present and fresh, else encode, cache, and return it.
+    """Load cached data from `cache_path` if present, else encode, cache, and return it.
 
     Shared skeleton for get_encoded_dataset and get_encoded_patches: ensures the cache directory
-    exists, loads and freshness-checks an existing cache, and otherwise runs `encode_pass`, saves
-    its result, and returns it.
+    exists, and either loads an existing cache or runs `encode_pass`, saves its result, and
+    returns it.
 
     Args:
         cache_path: Path to load data from / save data to.
         encode_pass: Callable () -> (blob, result); `blob` is the exact dict to `torch.save`,
             `result` is what to return to the caller on a cache miss.
-        is_fresh: Callable (blob) -> bool deciding whether a loaded cache is still valid.
-            Defaults to always-fresh (no staleness guard).
         from_cache: Callable (blob) -> result, extracting the return value from a loaded blob.
 
     Returns:
@@ -203,18 +191,14 @@ def _load_or_encode(
         os.makedirs(parent, exist_ok=True)
 
     if os.path.exists(cache_path):
-        blob = torch.load(cache_path, map_location="cpu")
-        if is_fresh(blob):
-            print(f"Loading cached data from {cache_path}.")
-            return from_cache(blob)
-        print(f"Cache {cache_path} is stale; regenerating.")
+        print(f"Loading cached data from {cache_path}.")
+        return from_cache(torch.load(cache_path, map_location="cpu"))
 
-    print("Cache not found / stale. Encoding...")
+    print("Cache not found. Encoding...")
     blob, result = encode_pass()
     torch.save(blob, cache_path)
     print(f"Saved to {cache_path}.")
     return result
-
 
 @torch.no_grad()
 def get_encoded_dataset(
@@ -225,10 +209,6 @@ def get_encoded_dataset(
     num_workers: int = 4,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Encode all images in a dataset, with on-disk caching.
-
-    If a cached file exists at `cache_path`, load and return it. Otherwise compute
-    features and labels in a single DataLoader pass, cache as a dict
-    {"features", "labels"}, and return.
 
     Args:
         dataset: Dataset yielding (image, label) pairs.
@@ -241,21 +221,26 @@ def get_encoded_dataset(
         A (features, labels) pair: features (N, D) on `device`, L2-normalized per
         row; labels (N, ...) on CPU, as produced by the dataset.
     """
+    model, _ = get_CLIP_model()
+    embed_dim = model.config.projection_dim  # adjust if your CLIP config exposes this differently
+
+    def encode_batch(model, inputs) -> torch.Tensor:
+        e = _as_feature_tensor(model.get_image_features(**inputs))
+        return F.normalize(e, p=2, dim=-1).cpu()
+
     def from_cache(blob):
         feats, labels = blob["features"].to(device), blob["labels"]
         print(f"features: {tuple(feats.shape)}, labels: {tuple(labels.shape)}")
         return feats, labels
 
     def encode_pass():
-        feats, labels = _collect_encoded(
-            _encode_image_batches(dataset, device, _encode_pooled_batch,
-                                   batch_size=batch_size, num_workers=num_workers),
-            n_total=len(dataset), keep_labels=True)
+        feats, labels = _encode_dataset(dataset, device, encode_batch,
+                                         out_shape=(embed_dim,), out_dtype=torch.float32,
+                                         batch_size=batch_size, num_workers=num_workers)
         print(f"features: {tuple(feats.shape)}, labels: {tuple(labels.shape)}")
         return {"features": feats, "labels": labels}, (feats.to(device), labels)
 
     return _load_or_encode(cache_path, encode_pass, from_cache=from_cache)
-
 
 @torch.no_grad()
 def get_encoded_patches(
@@ -266,16 +251,14 @@ def get_encoded_patches(
     batch_size: int = 64,
     num_workers: int = 4,
 ) -> torch.Tensor:
-    """Encode images into CLIP's per-token visual sequence ``[CLS ; 49 patch]``, with caching.
+    """Encode images into CLIP's per-token visual sequence, with caching.
 
-    Unlike ``get_encoded_dataset`` (which returns the single pooled, projected image embedding),
-    this taps the vision tower's ``last_hidden_state`` to keep the global CLS token and the 49
-    patch tokens, giving the fusion module spatially grounded conditions. Tokens are stored in
-    fp16 and are *not* L2-normalized, since they feed a learned projection rather than a cosine
-    score. The returned bank is kept on CPU (it can be large); callers move the slices they need
-    onto the device. The cache records which dataset ``indices`` it covers so a stale subset can
-    never be silently reused.
-
+    Each image's visual embedding is exactly two things concatenated: 
+    - one **CLS token**: CLIP's learned global summary of the whole image, not a patch
+    - 49 spatial patch tokens. 
+    
+    This function accesses the vision tower's ``last_hidden_state`` to retrieve both, giving the fusion module spatially grounded
+    conditions.
     Args:
         dataset: Dataset yielding (image, label) pairs.
         device: Device the CLIP forward runs on.
@@ -283,18 +266,17 @@ def get_encoded_patches(
         indices: Optional subset of dataset indices to encode (in this order). None encodes all.
         batch_size: DataLoader batch size.
         num_workers: DataLoader worker count.
-
     Returns:
         A (len(indices) or N, 50, 768) fp16 tensor of visual tokens on CPU, row-aligned to
         `indices` (or to the dataset order when `indices` is None).
     """
-    idx_list = list(range(len(dataset))) if indices is None else list(indices)
+    model, _ = get_CLIP_model()
+    hidden_size = model.config.hidden_size  # adjust if your CLIP config exposes this differently
+    num_patches = (model.config.image_size // model.config.patch_size) ** 2
+    seq_len = num_patches + 1  # +1 for the CLS token
 
-    def is_fresh(blob):
-        cached_idx = blob.get("indices")
-        # Length check first: cheap, and short-circuits the full list comparison on the
-        # (common) case of a totally different subset.
-        return cached_idx is not None and len(cached_idx) == len(idx_list) and cached_idx == idx_list
+    def encode_batch(model, inputs) -> torch.Tensor:
+        return model.vision_model(pixel_values=inputs["pixel_values"]).last_hidden_state.half().cpu()
 
     def from_cache(blob):
         patches = blob["patches"]
@@ -302,18 +284,118 @@ def get_encoded_patches(
         return patches
 
     def encode_pass():
-        patches, _ = _collect_encoded(
-            _encode_image_batches(dataset, device, _encode_token_batch, indices=idx_list,
-                                   batch_size=batch_size, num_workers=num_workers),
-            n_total=len(idx_list), keep_labels=False)
+        patches, _ = _encode_dataset(dataset, device, encode_batch, indices=indices,
+                                      out_shape=(seq_len, hidden_size), out_dtype=torch.float16,
+                                      batch_size=batch_size, num_workers=num_workers,
+                                      keep_labels=False)
         print(f"patches: {tuple(patches.shape)}")
-        return {"indices": idx_list, "patches": patches}, patches
+        return {"patches": patches}, patches
 
-    return _load_or_encode(cache_path, encode_pass, is_fresh=is_fresh, from_cache=from_cache)
+    return _load_or_encode(cache_path, encode_pass, from_cache=from_cache)
+
+#==============================================================================
+# Cell  11 [code] - Shared attribute/query helpers (names, index maps, signed-query parser)
+#==============================================================================
+
+_attribute_names_cache: list[str] | None = None
+
+def get_attribute_names(dataset=None) -> list[str]:
+    """Return the dataset's attribute names, filtering out any empty strings.
+
+    Memoized after the first call: CelebA's `attr_names` has 41 entries (one empty
+    string), so this filters and caches the 40 non-empty names once, instead of
+    recomputing the same list comprehension at every call site.
+
+    Args:
+        dataset: A CelebA dataset object exposing `attr_names`. Defaults to the global
+            `celeba` test-split dataset (loaded in the "Load CelebA test split" cell).
+
+    Returns:
+        The 40 non-empty attribute names, aligned with the label columns.
+    """
+    global _attribute_names_cache
+    if _attribute_names_cache is None:
+        if dataset is None:
+            dataset = celeba
+        _attribute_names_cache = [name for name in dataset.attr_names if name]
+    return _attribute_names_cache
+
+
+_attribute_index_cache: dict[str, int] | None = None
+
+def attribute_to_index(name: str) -> int:
+    """Return the column index of a CelebA attribute name.
+
+    Args:
+        name: Attribute name, e.g. "Bald".
+
+    Returns:
+        The attribute's position in the 40-column label vector.
+    """
+    global _attribute_index_cache
+    if _attribute_index_cache is None:
+        _attribute_index_cache = {n: i for i, n in enumerate(get_attribute_names())}
+    return _attribute_index_cache[name]
+
+
+def index_to_attribute(index: int) -> str:
+    """Return the CelebA attribute name at a given column index.
+
+    Args:
+        index: Position in the 40-column label vector.
+
+    Returns:
+        The attribute name at that position.
+    """
+    return get_attribute_names()[index]
+
+
+def query_to_signed_indices(text_query: str) -> tuple[list[int], list[int]]:
+    """Shared Query parser. Does two things at once:
+    - Splits each comma-separated term into its "+" / "-" sign.
+    - Maps the attribute name to its column index.
+
+    Args:
+        text_query: Comma-separated signed query, e.g. "+Bald, -Eyeglasses".
+
+    Returns:
+        A (pos_idx, neg_idx) pair of attribute-index lists for the "+" and "-" terms.
+    """
+    pos_idx, neg_idx = [], []
+    for component in text_query.split(","):
+        component = component.strip()
+        if not component:
+            continue
+        sign_char, attr_name = component[0], component[1:].strip()
+        j = attribute_to_index(attr_name)
+        (pos_idx if sign_char == "+" else neg_idx).append(j)
+    return pos_idx, neg_idx
+
+
+_attribute_text_embs_cache: torch.Tensor | None = None
+
+def get_attribute_text_embeddings(device) -> torch.Tensor:
+    """Lazily encode and cache the bare-name CLIP text bank for the 40 attributes.
+
+    Every attribute name becomes a bare lowercase phrase (e.g. "Wearing_Hat" -> "wearing
+    hat"); training-free and training-based methods alike reuse this same bank, so it's
+    encoded once and cached rather than re-run per call site.
+
+    Args:
+        device: Device to place the cached embeddings on.
+
+    Returns:
+        A (40, D) L2-normalized CLIP text embedding, one row per `get_attribute_names()` entry.
+    """
+    global _attribute_text_embs_cache
+    if _attribute_text_embs_cache is None:
+        bare_attribute_prompts = [name.replace("_", " ").lower() for name in get_attribute_names()]
+        _attribute_text_embs_cache = encode_texts(bare_attribute_prompts, device)
+    return _attribute_text_embs_cache
 
 
 #==============================================================================
-# Cell  11 [code] - def plot_images(celeba_dataset: object, indices: list[int], n_cols: int, n_ro…
+# Cell  12 [code] - def plot_images(celeba_dataset: object, indices: list[int], n_cols: int, n_ro…
 #==============================================================================
 
 def plot_images(celeba_dataset: object, indices: list[int], n_cols: int, n_rows: int, figsize: tuple[int, int]=(20, 10)):
@@ -342,7 +424,6 @@ def plot_images(celeba_dataset: object, indices: list[int], n_cols: int, n_rows:
 
     plt.tight_layout()
     plt.show()
-
 
 def plot_image_row(images, titles=None, title_colors=None, figsize=None):
     """Plot a single row of images with optional per-image titles and colors.
@@ -373,9 +454,35 @@ def plot_image_row(images, titles=None, title_colors=None, figsize=None):
     plt.tight_layout()
     plt.show()
 
+def plot_image_with_attributes(idx: int, figsize: tuple[int, int]=(10, 5)):
+    """Plot a single image with its active attributes listed as text alongside it.
+
+    Args:
+        idx: Dataset index of the image to plot.
+        figsize: Figure size as (width, height).
+    """
+    img, labels = celeba[idx]
+    active_attrs = [index_to_attribute(idx) for idx, value in enumerate(labels) if value == 1]
+
+    fig, (ax_img, ax_text) = plt.subplots(1, 2, figsize=figsize)
+    ax_img.imshow(img)
+    ax_img.axis('off')
+
+    ax_text.axis('off')
+    text = "\n".join(active_attrs)
+
+    ax_text.text(
+        0.5, 0.5, text,
+        fontsize=10,
+        ha='center',   
+        va='center'    
+    )
+
+    plt.tight_layout()
+    plt.show()
 
 #==============================================================================
-# Cell  13 [code] - def plot_metrics_across_k(average_results_per_query: list[dict], title: str =…
+# Cell  14 [code] - def plot_metrics_across_k(average_results_per_query: list[dict], title: str =…
 #==============================================================================
 
 def plot_metrics_across_k(average_results_per_query: list[dict], title: str = "Retrieval Metrics across K"):
@@ -418,7 +525,6 @@ def plot_metrics_across_k(average_results_per_query: list[dict], title: str = "R
 
     plt.tight_layout()
     plt.show()
-
 
 def plot_methods_comparison(method_results: dict[str, list[dict]], title: str = "Method Comparison across queries"):
     """Plot a per-query line comparison of N retrieval methods.
@@ -466,7 +572,6 @@ def plot_methods_comparison(method_results: dict[str, list[dict]], title: str = 
 
     plt.tight_layout()
     plt.show()
-
 
 def plot_results_table(
     method_results: dict[str, list[dict]],
@@ -522,14 +627,11 @@ def plot_results_table(
     plt.tight_layout()
     plt.show()
 
-
 #==============================================================================
-# Cell  15 [code] - Load CelebA test split
+# Cell  16 [code] - Load CelebA test split
 #==============================================================================
 
-# Do *not* put `celeba` in the path, the dataset class adds it automatically
-data_root = Path("/content/datasets")
-celeba = CelebA(root=data_root, split="test", download=False)
+celeba = CelebA(root=CELEBA_ROOT, split="test", download=False)
 
 # This should be 19.962
 print("Number of samples:", len(celeba))
@@ -539,33 +641,16 @@ sample_img, sample_attrs = celeba[0]
 print(f"Sample image size: {sample_img.size}")
 print(f"Number of attributes: {len(sample_attrs)}")
 
-def get_attribute_names(dataset) -> list[str]:
-    """Return the dataset's attribute names, dropping torchvision's spurious empty entry.
-
-    torchvision's CelebA exposes `attr_names` with 41 entries (one is an empty string),
-    while the label tensor has 40 columns. Dropping empties keeps the names aligned with
-    the label columns and with the learned per-attribute embedding rows.
-
-    Args:
-        dataset: A CelebA dataset object exposing `attr_names`.
-
-    Returns:
-        The 40 non-empty attribute names, aligned with the label columns.
-    """
-    return [name for name in dataset.attr_names if name]
-
-
 #==============================================================================
-# Cell  17 [code] - Visualize 50 random samples
+# Cell  18 [code] - Visualize 50 random samples
 #==============================================================================
 
 # Get 50 random images and visualize them
 indices = np.random.choice(len(celeba), size=50, replace=False)
 plot_images(celeba, indices=indices, n_cols=10, n_rows=5)
 
-
 #==============================================================================
-# Cell  19 [code] - Attribute frequency table
+# Cell  20 [code] - Attribute frequency table
 #==============================================================================
 
 all_labels = celeba.attr.numpy()
@@ -579,93 +664,37 @@ print("-" * 45)
 for attr, count, freq in zip(get_attribute_names(celeba), attr_counts, attr_freq):
     print(f"{attr:<20} {count:>10} {freq:>10.3f}")
 
-
 #==============================================================================
-# Cell  21 [code] - Attribute name/index maps & retrieve_by_attributes
+# Cell  22 [code] - Attribute name/index maps & retrieve_by_attributes
 #==============================================================================
 
 attr_names = get_attribute_names(celeba)
-idx2attribute = {idx: name for idx, name in enumerate(attr_names)}
-attribute2idx = {name: idx for idx, name in enumerate(attr_names)}
 
-def retrieve_by_attributes(parameters:dict):
+def retrieve_by_attributes(query:dict):
     """Retrieve all dataset images that satisfy the given attribute conditions.
-
     Args:
-        parameters: Dict mapping attribute name to "+" (must have the attribute) or "-" (must not have the attribute).
-
+        query: Dict mapping attribute name to "+" (must have the attribute) or "-" (must not have the attribute).
     Returns:
         Indices of images that satisfy every specified condition.
     """
     # Boolean mask over the precomputed label matrix
     mask = np.ones(len(all_labels), dtype=bool)
-    for attr_name, value in parameters.items():
-        attr_idx = attribute2idx[attr_name]
-        if value == "+":
+
+    # For each attribute condition, update the mask to keep only images that satisfy it
+    for attr_name, sign in query.items():
+        attr_idx = attribute_to_index(attr_name)
+        if sign == "+":
             mask &= all_labels[:, attr_idx] == 1
-        elif value == "-":
+        elif sign == "-":
             mask &= all_labels[:, attr_idx] == 0
         else:
-            raise ValueError(f"Invalid value for attribute condition: {value}. Use '+' or '-'.")
+            raise ValueError(f"Invalid sign for attribute condition: {sign}. Use '+' or '-'.")
 
     return np.nonzero(mask)[0].tolist()
 
-def plot_image_with_attributes(idx: int, figsize: tuple[int, int]=(10, 5)):
-    """Plot a single image with its active attributes listed as text alongside it.
-
-    Args:
-        idx: Dataset index of the image to plot.
-        figsize: Figure size as (width, height).
-    """
-    img, labels = celeba[idx]
-    active_attrs = [idx2attribute[idx] for idx, value in enumerate(labels) if value == 1]
-
-    fig, (ax_img, ax_text) = plt.subplots(1, 2, figsize=figsize)
-    ax_img.imshow(img)
-    ax_img.axis('off')
-
-    ax_text.axis('off')
-    text = "\n".join(active_attrs)
-
-    ax_text.text(
-        0.5, 0.5, text,
-        fontsize=10,
-        ha='center',   
-        va='center'    
-    )
-
-    plt.tight_layout()
-    plt.show()
-
-
-def parse_query_signs(text_query: str) -> tuple[list[int], list[int]]:
-    """Parse a signed attribute query into positive and negative attribute indices.
-
-    For example, '+Bald, -Eyeglasses' becomes
-    ([attribute2idx['Bald']], [attribute2idx['Eyeglasses']]). Shared query parser
-    consumed by every method that reads the benchmark query string (Source-Attribute
-    Matching, Cross-Attention Fusion, qualitative inspection), so it lives here with
-    the other attribute/query utilities rather than inside one method.
-
-    Args:
-        text_query: Comma-separated signed query, e.g. "+Bald, -Eyeglasses".
-
-    Returns:
-        A (pos_idx, neg_idx) pair of attribute-index lists for the "+" and "-" terms.
-    """
-    pos_idx, neg_idx = [], []
-    for component in text_query.split(","):
-        component = component.strip()
-        if not component:
-            continue
-        sign_char, attr_name = component[0], component[1:].strip()
-        j = attribute2idx[attr_name]
-        (pos_idx if sign_char == "+" else neg_idx).append(j)
-    return pos_idx, neg_idx
-
 
 #==============================================================================
-# Cell  23 [code] - Inspect a single image's attributes
+# Cell  24 [code] - Inspect a single image's attributes
 #==============================================================================
 
 IMAGE_INDEX = 99
@@ -673,17 +702,20 @@ plot_image_with_attributes(IMAGE_INDEX)
 
 
 #==============================================================================
-# Cell  25 [code] - Example signed attribute query
+# Cell  26 [code] - Example signed attribute query
 #==============================================================================
 
-query_1 = {"Bald": "+",
+# YOU CAN CHANGE THIS QUERY TO TEST DIFFERENT ATTRIBUTE COMBINATIONS.
+# RERUN THE CELL TO SEE THE RESULTS.
+test_query = {"Bald": "+",
            "Smiling": "+",
            "Eyeglasses": "-",
            }
-retrieved_images = retrieve_by_attributes(query_1)
+
+retrieved_images = retrieve_by_attributes(test_query)
 print(f"Number of retrieved images: {len(retrieved_images)}")
 
-# Plot up to 10 random retrieved images (without replacement).
+# Plot up to 10 random retrieved images
 n_samples = min(10, len(retrieved_images))
 if n_samples == 0:
     print("No images match this query.")
@@ -695,14 +727,6 @@ else:
 
 
 #==============================================================================
-# Cell  27 [code] - Embedding cache paths
-#==============================================================================
-
-EVALUATION_CACHE_DIR = "/content/drive/MyDrive/datasets/clip_cache"
-EVALUATION_CACHE_PATH = os.path.join(EVALUATION_CACHE_DIR, "embeddings.pt")
-
-
-#==============================================================================
 # Cell  28 [code] - Encode (or load cached) gallery embeddings
 #==============================================================================
 
@@ -711,19 +735,7 @@ gallery_embeddings, gallery_labels = get_encoded_dataset(celeba, device, EVALUAT
 
 
 #==============================================================================
-# Cell  30 [code] - Load sanity-check source image
-#==============================================================================
-
-SANITY_SOURCE_IDX = 10006
-img, _ = celeba[SANITY_SOURCE_IDX]
-
-plt.figure(figsize=(4, 4))
-plt.axis('off')
-plt.imshow(img)
-
-
-#==============================================================================
-# Cell  32 [code] - Nearest neighbors by cosine similarity
+# Cell  30 [code] - Nearest neighbors by cosine similarity (sanity check)
 #==============================================================================
 
 if "gallery_embeddings" not in globals():
@@ -731,35 +743,30 @@ if "gallery_embeddings" not in globals():
         "Embeddings not found. Run the offline feature extraction cell above first."
     )
 
-source_embedding = gallery_embeddings[SANITY_SOURCE_IDX]
+SANITY_SOURCE_IDX = 10006
 
 # Dot product == cosine similarity for unit-norm embeddings
-similarities = gallery_embeddings @ source_embedding
+similarities = gallery_embeddings @ gallery_embeddings[SANITY_SOURCE_IDX]
 
 # Get the 6 highest-similarity matches and drop the source itself.
 top_vals, top_idx = torch.topk(similarities, k=6)
-nearest_indices = top_idx[1:].tolist()       
-nearest_similarities = top_vals[1:].tolist()  
+nearest_indices = top_idx[1:].tolist()
+nearest_similarities = top_vals[1:].tolist()
 
-print("Nearest indices:", nearest_indices)
-print("Nearest cosine similarities:", nearest_similarities)
-
-
-#==============================================================================
-# Cell  34 [code] - Plot nearest-neighbor results
-#==============================================================================
-
-images = [celeba[idx][0] for idx in nearest_indices]
-titles = [f"Cosine sim: {sim:.4f}" for sim in nearest_similarities]
-plot_image_row(images, titles=titles, figsize=(25, 5))
+images = [celeba[SANITY_SOURCE_IDX][0]] + [celeba[idx][0] for idx in nearest_indices]
+titles = ["Source"] + [f"Cosine sim: {sim:.4f}" for sim in nearest_similarities]
+title_colors = ["tab:blue"] + ["black"] * len(nearest_indices)
+plot_image_row(images, titles=titles, title_colors=title_colors, figsize=(25, 5))
 
 
 #==============================================================================
-# Cell  36 [code] - def _select_pure_image_idxs(all_labels: np.ndarray, rng: np.random.Generator)…
+# Cell  34 [code] - def _select_pure_image_idxs(all_labels: np.ndarray, rng: np.random.Generator)…
 #==============================================================================
 
 def _select_pure_image_idxs(all_labels: np.ndarray, rng: np.random.Generator) -> list[int]:
-    """Pick, for each attribute, a "pure" image: positive for it with the fewest other positives.
+    """Return a list of image indices, one per attribute, that are "pure" positives for that attribute.
+    A "pure" positive is defined as an image that has the attribute in question and has the least number of other attributes. 
+    If multiple images have the same minimal number of other attributes, one is chosen at random.
 
     Args:
         all_labels: (N, n_attrs) binary attribute-label matrix.
@@ -818,29 +825,23 @@ def _print_cosine_diagnostics(cos_mat: np.ndarray) -> None:
     print(f"Diagonal-argmax rate:      {diag_argmax_rate:.2%} (attributes where the matching image is the row's argmax)")
 
 
-# Bare-name attribute text bank: reused downstream by other methods
-prompts = [name.replace("_", " ").lower() for name in attr_names]
-ATTR_TEXT_EMBS = encode_texts(prompts, device).to(gallery_embeddings.device)
-
-
 rng = np.random.default_rng(seed=0)
 selected_idxs = _select_pure_image_idxs(all_labels, rng)
-selected_img_embs = gallery_embeddings[selected_idxs].to(ATTR_TEXT_EMBS.device)
+selected_img_embs = gallery_embeddings[selected_idxs].to(device)
 
-
-cos_mat = (ATTR_TEXT_EMBS @ selected_img_embs.T).detach().cpu().numpy()
+cos_mat = (get_attribute_text_embeddings(device) @ selected_img_embs.T).detach().cpu().numpy()
 _print_cosine_diagnostics(cos_mat)
 
 
 #==============================================================================
-# Cell  38 [code] - Plot attribute cosine-similarity heatmap
+# Cell  36 [code] - Plot attribute cosine-similarity heatmap
 #==============================================================================
 
 plot_cosine_heatmap(cos_mat, attr_names)
 
 
 #==============================================================================
-# Cell  40 [code] - def evaluate_retrieval(
+# Cell  38 [code] - def evaluate_retrieval(
 #==============================================================================
 
 def evaluate_retrieval(
@@ -899,35 +900,15 @@ def mean_recall_at_10(evaluation_results: list[dict]) -> float:
 
 
 #==============================================================================
-# Cell  42 [code] - Example usage of evaluate_retrieval
-#==============================================================================
-
-# Suppose the model returns these indices from most to least similar:
-predictions = [1, 2, 3, 4, 5]
-# And we load this from our JSON for this specific source:
-ground_truth = [3, 2, 1]
-
-# Evaluate at K=1 and K=5
-print("Results @ 1:", evaluate_retrieval(predictions, ground_truth, k=1))
-print("Results @ 5:", evaluate_retrieval(predictions, ground_truth, k=5))
-
-
-#==============================================================================
-# Cell  44 [code] - Load benchmark annotations JSON
+# Cell  42 [code] - Load benchmark annotations JSON
 #==============================================================================
 
 # Open the JSON file containing the benchmark annotations
-annotations_path = Path("/content/drive/MyDrive/datasets/celeba_evaluation.json")
-with open(annotations_path, "r") as f:
+with open(BENCHMARK_ANNOTATIONS_PATH, "r") as f:
     annotations = json.load(f)
 
 # Print the number of annotations loaded
 print(f"Loaded {len(annotations)} queries!")
-
-
-#==============================================================================
-# Cell  46 [code] - Inspect annotation structure
-#==============================================================================
 
 # Display a sample annotation to understand the structure of the data
 print("Sample annotation shape", annotations[0].keys())
@@ -941,6 +922,10 @@ print("Source-Image example:", list(annotations[0].get("ground_truth", {}).keys(
 # Extract and print the list of ground truth indices for the first annotation
 print("List of ground truth indices for the first annotation:", annotations[0].get("ground_truth", {}).get("13", [])[:5], "...")
 
+#==============================================================================
+# Cell  42 [code] - Helper functions to extract query and ground-truth info from benchmark annotations
+# TODO: go on from here!
+#==============================================================================
 def get_text_query(annotation: dict) -> str:
     """Extract the text query from a benchmark annotation.
 
@@ -964,8 +949,8 @@ def get_source_image_idxs(annotation: dict) -> list[int]:
     # The "ground_truth" keys must be converted to int since JSON keys are always strings
     return [int(key) for key in annotation.get("ground_truth", {}).keys()]
 
-def get_ground_truth_indices(annotation: dict, source_image_idx: int) -> list[int]:
-    """Extract the valid target IDs for one source image from a benchmark annotation.
+def get_target_indices(annotation: dict, source_image_idx: int) -> list[int]:
+    """Extract the target image IDs for a given source image from a benchmark annotation.
 
     Args:
         annotation: Benchmark annotation dict for a single query.
@@ -978,7 +963,7 @@ def get_ground_truth_indices(annotation: dict, source_image_idx: int) -> list[in
 
 
 #==============================================================================
-# Cell  48 [code] - Sanity-check annotation helper functions
+# Cell  46 [code] - Sanity-check annotation helper functions
 #==============================================================================
 
 # Let's test these utility functions on the first annotation in the dataset
@@ -992,14 +977,14 @@ print("Source image index:", source_image_idx)
 plot_image_with_attributes(source_image_idx, figsize=(4, 4))
 
 # Get the first 5 ground truth indices for this annotation and source image
-ground_truth_indices = get_ground_truth_indices(annotation, source_image_idx)[:5]
+ground_truth_indices = get_target_indices(annotation, source_image_idx)[:5]
 print("Ground truth indices for this query:", ground_truth_indices)
 
 plot_images(celeba, indices=ground_truth_indices, n_cols=5, n_rows=1, figsize=(10, 2))
 
 
 #==============================================================================
-# Cell  50 [code] - def retrieve_topk(scores: torch.Tensor, exclude_idx: int, k: int = 10) -> lis…
+# Cell  48 [code] - def retrieve_topk(scores: torch.Tensor, exclude_idx: int, k: int = 10) -> lis…
 #==============================================================================
 
 def retrieve_topk(scores: torch.Tensor, exclude_idx: int, k: int = 10) -> list[int]:
@@ -1051,7 +1036,7 @@ def evaluate(
         for src in get_source_image_idxs(annotation):
             retrieved = retrieve_topk(scorer(src), exclude_idx=src, k=10)
             per_source[src] = {
-                k: evaluate_retrieval(retrieved, get_ground_truth_indices(annotation, src), k)
+                k: evaluate_retrieval(retrieved, get_target_indices(annotation, src), k)
                 for k in (1, 5, 10)
             }
         results.append(per_source)
@@ -1119,7 +1104,7 @@ def evaluate_and_average(annotations: list[dict], make_scorer: Callable, verbose
 
 
 #==============================================================================
-# Cell  53 [code] - def baseline_scorer(gallery_embeddings: torch.Tensor) -> Callable
+# Cell  51 [code] - def baseline_scorer(gallery_embeddings: torch.Tensor) -> Callable
 #==============================================================================
 
 def baseline_scorer(gallery_embeddings: torch.Tensor) -> Callable:
@@ -1127,8 +1112,8 @@ def baseline_scorer(gallery_embeddings: torch.Tensor) -> Callable:
 
     Decomposes the query into signed attribute terms and fuses them with the source
     image embedding by simple latent arithmetic.
-    Attribute text embeddings come from the bare-name CLIP bank (ATTR_TEXT_EMBS); the
-    per-query delta is built once per annotation and reused for every source image.
+    Attribute text embeddings come from the bare-name CLIP bank (get_attribute_text_embeddings);
+    the per-query delta is built once per annotation and reused for every source image.
 
     Args:
         gallery_embeddings: (N, D) gallery image embeddings, L2-normalized per row.
@@ -1138,13 +1123,14 @@ def baseline_scorer(gallery_embeddings: torch.Tensor) -> Callable:
     """
     def make_scorer(annotation: dict) -> Callable:
         """Build a per-query scorer from the query's signed attribute delta."""
-        pos_idx, neg_idx = parse_query_signs(get_text_query(annotation))
+        attr_text_embs = get_attribute_text_embeddings(gallery_embeddings.device)
+        pos_idx, neg_idx = query_to_signed_indices(get_text_query(annotation))
         # Initialize delta vector to zero, then add/subtract attribute embeddings based on the query
         delta = torch.zeros(gallery_embeddings.shape[1], device=gallery_embeddings.device)
         if pos_idx:
-            delta = delta + ATTR_TEXT_EMBS[pos_idx].sum(dim=0)
+            delta = delta + attr_text_embs[pos_idx].sum(dim=0)
         if neg_idx:
-            delta = delta - ATTR_TEXT_EMBS[neg_idx].sum(dim=0)
+            delta = delta - attr_text_embs[neg_idx].sum(dim=0)
 
         def scorer(source_idx: int) -> torch.Tensor:
             """Score every gallery image against the fused source query embedding."""
@@ -1156,7 +1142,7 @@ def baseline_scorer(gallery_embeddings: torch.Tensor) -> Callable:
 
 
 #==============================================================================
-# Cell  55 [code] - Evaluate & plot baseline
+# Cell  53 [code] - Evaluate & plot baseline
 #==============================================================================
 
 evaluation_results_baseline, average_results_per_query_baseline = evaluate_and_average(
@@ -1169,7 +1155,7 @@ plot_metrics_across_k(average_results_per_query_baseline, title="Baseline Fusion
 
 
 #==============================================================================
-# Cell  58 [code] - Grid-search weight candidates
+# Cell  56 [code] - Grid-search weight candidates
 #==============================================================================
 
 GRID_W_ATTR = [0.05, 0.1, 0.2, 0.4]   # attribute-proximity penalty weight candidates
@@ -1177,7 +1163,7 @@ GRID_W_VISUAL  = [0.0, 0.5, 1.0]          # visual identity weight candidates
 
 
 #==============================================================================
-# Cell  61 [code] - compute_attribute_logits
+# Cell  59 [code] - compute_attribute_logits
 #==============================================================================
 
 def compute_attribute_logits(
@@ -1253,7 +1239,7 @@ def attribute_matching_scorer(
 
     def make_scorer(annotation: dict) -> Callable:
         """Build a per-query scorer from the query's constraint vector."""
-        pos_idx, neg_idx = parse_query_signs(get_text_query(annotation))
+        pos_idx, neg_idx = query_to_signed_indices(get_text_query(annotation))
         queried   = set(pos_idx + neg_idx)
         unqueried = [j for j in range(Z.shape[1]) if j not in queried]
         constraint = Z[:, pos_idx].sum(dim=1) - Z[:, neg_idx].sum(dim=1)  # (N,)
@@ -1272,7 +1258,7 @@ def attribute_matching_scorer(
 
 
 #==============================================================================
-# Cell  64 [code] - Grid search over fusion weights
+# Cell  62 [code] - Grid search over fusion weights
 #==============================================================================
 
 grid_rows = []
@@ -1280,7 +1266,7 @@ for w_p in GRID_W_ATTR:
     for w_v in GRID_W_VISUAL:
         res = evaluate(
             annotations,
-            attribute_matching_scorer(gallery_embeddings, ATTR_TEXT_EMBS, w_query=1.0, w_attr=w_p, w_visual=w_v),
+            attribute_matching_scorer(gallery_embeddings, get_attribute_text_embeddings(device), w_query=1.0, w_attr=w_p, w_visual=w_v),
             verbose=False,
         )
         r10 = mean_recall_at_10(res)
@@ -1293,12 +1279,12 @@ SAM_WEIGHTS = dict(w_query=1.0, w_attr=best_w_attr, w_visual=best_w_visual)
 
 
 #==============================================================================
-# Cell  66 [code] - Evaluate & plot Source-Attribute Matching
+# Cell  64 [code] - Evaluate & plot Source-Attribute Matching
 #==============================================================================
 
 evaluation_results_sam, average_results_per_query_sam = evaluate_and_average(
     annotations,
-    attribute_matching_scorer(gallery_embeddings, ATTR_TEXT_EMBS, **SAM_WEIGHTS),
+    attribute_matching_scorer(gallery_embeddings, get_attribute_text_embeddings(device), **SAM_WEIGHTS),
 )
 print(f"Source-Attribute Matching: mean Recall@10 = {mean_recall_at_10(evaluation_results_sam):.4f}")
 
@@ -1309,7 +1295,7 @@ plot_metrics_across_k(
 
 
 #==============================================================================
-# Cell  71 [code] - Attribute phrase bank (positive/negative)
+# Cell  69 [code] - Attribute phrase bank (positive/negative)
 #==============================================================================
 
 # Person-referring positive AND negative phrases for each CelebA attribute.
@@ -1408,7 +1394,7 @@ humanized_mappings_neg = {
 
 
 #==============================================================================
-# Cell  73 [code] - CLIP ImageNet-style prompt templates
+# Cell  71 [code] - CLIP ImageNet-style prompt templates
 #==============================================================================
 
 # CLIP's official ImageNet templates, article-stripped for {phrase} noun phrases
@@ -1496,7 +1482,7 @@ print(f"E_POS: {tuple(E_POS.shape)},  E_NEG: {tuple(E_NEG.shape)}")
 
 
 #==============================================================================
-# Cell  75 [code] - Evaluate & plot Prompt Ensembling
+# Cell  73 [code] - Evaluate & plot Prompt Ensembling
 #==============================================================================
 
 # Same scoring layer and weights as Source-Attribute Matching — only the embedding bank changes.
@@ -1519,7 +1505,7 @@ plot_methods_comparison(
 
 
 #==============================================================================
-# Cell  79 [code] - Cross-Attention Fusion hyperparameters
+# Cell  77 [code] - Cross-Attention Fusion hyperparameters
 #==============================================================================
 
 CA_HEADS          = 4          # cross-attention heads
@@ -1528,7 +1514,7 @@ CA_FFN_MULT       = 2          # transformer FFN hidden size = CA_FFN_MULT * dim
 CA_DROPOUT        = 0.1        # dropout inside the transformer layers
 CA_GROUND_LAYERS  = 1          # patch-grounding decoder layers (conditions read the visual tokens)
 CA_GROUND_HEADS   = 4          # attention heads in the grounding decoder
-CLIP_VIS_DIM      = 768        # CLIP ViT-B/32 hidden width of the [CLS ; 49 patch] tokens
+CLIP_VIS_DIM      = 768        # CLIP ViT-B/32 hidden width of the visual tokens (CLS + 49 patches)
 CA_TRAIN_TRIPLETS = 100_000    # synthetic training triplets (own pool)
 CA_VAL_TRIPLETS   = 2_000      # synthetic validation triplets
 CA_EPOCHS         = 20         # training epochs
@@ -1544,7 +1530,7 @@ CA_GATE_BIAS_INIT = 2.0        # gated-residual gate-open bias; sigmoid(2.0)≈0
 
 
 #==============================================================================
-# Cell  84 [code] - class CrossAttentionFusion(nn.Module)
+# Cell  82 [code] - class CrossAttentionFusion(nn.Module)
 #==============================================================================
 
 class CrossAttentionFusion(nn.Module):
@@ -1556,8 +1542,8 @@ class CrossAttentionFusion(nn.Module):
     ``conds = (1 + gamma) * attr_text + beta``, where ``(gamma, beta)`` are produced per sign, so
     ``+attr`` and ``-attr`` become genuinely distinct, per-dimension vectors. Before the image
     weighs them, a *patch-grounding* stage lets the conditions read the source's frozen CLIP
-    visual tokens ``[CLS ; 49 patches]`` (the global CLS summary plus the 49 spatial patches of a
-    ViT-B/32): the conditions self-attend (co-adapt to one another, tempering mutually exclusive or
+    visual tokens - the CLS token (CLIP's global summary of a ViT-B/32 image) plus its 49
+    spatial patches: the conditions self-attend (co-adapt to one another, tempering mutually exclusive or
     contradictory edits before the image ever reads them) and cross-attend over those tokens, so a
     localized edit can latch onto the relevant region of *this* source rather than a generic
     attribute direction. The image (a single query token) then attends over the grounded
@@ -1601,9 +1587,9 @@ class CrossAttentionFusion(nn.Module):
         nn.init.zeros_(self.film.bias)
 
         # Patch grounding: project the frozen CLIP visual tokens into the fusion space and tag the
-        # global CLS token apart from the 49 patches, then let the conditions read them.
+        # CLS token apart from the 49 patches, then let the conditions read them.
         self.vis_proj = nn.Linear(clip_dim, dim)
-        self.vis_type = nn.Embedding(2, dim)               # 0: global CLS (position 0)   1: patch
+        self.vis_type = nn.Embedding(2, dim)               # 0: CLS (position 0)   1: patch
         nn.init.normal_(self.vis_type.weight, std=film_sign_std)
         ground_layer = nn.TransformerDecoderLayer(
             dim, ground_heads, dim_feedforward=ffn_mult * dim, dropout=dropout,
@@ -1633,7 +1619,8 @@ class CrossAttentionFusion(nn.Module):
 
         Args:
             img_emb: (B, D) L2-normalized source image embeddings.
-            vis_tokens: (B, 50, clip_dim) raw CLIP visual tokens [CLS ; 49 patches] for the source.
+            vis_tokens: (B, 50, clip_dim) raw CLIP visual tokens (CLS at position 0, then
+                49 patches) for the source.
             cond_attr: (B, T) attribute indices for each condition.
             cond_sign: (B, T) signs in {+1, -1, 0}; 0 marks padding.
 
@@ -1653,7 +1640,7 @@ class CrossAttentionFusion(nn.Module):
         # (ground spatially) over them.
         V = self.vis_proj(vis_tokens.to(self.vis_proj.weight.dtype))        # (B, 50, D)
         type_id = torch.ones(V.shape[1], dtype=torch.long, device=V.device)
-        type_id[0] = 0                                                      # position 0 is the global CLS token
+        type_id[0] = 0                                                      # position 0 is the CLS token
         V = V + self.vis_type(type_id)                                      # broadcast over batch
         conds = self.ground(conds, V, tgt_key_padding_mask=pad_mask)        # (B, T, D) grounded
 
@@ -1669,7 +1656,7 @@ class CrossAttentionFusion(nn.Module):
 
 
 ca_model = CrossAttentionFusion(
-    ATTR_TEXT_EMBS, gallery_embeddings.shape[1],
+    get_attribute_text_embeddings(device), gallery_embeddings.shape[1],
     n_heads=CA_HEADS, n_layers=CA_LAYERS, ffn_mult=CA_FFN_MULT, dropout=CA_DROPOUT,
     film_sign_std=CA_FILM_SIGN_STD, gate_bias_init=CA_GATE_BIAS_INIT,
     clip_dim=CLIP_VIS_DIM, ground_layers=CA_GROUND_LAYERS, ground_heads=CA_GROUND_HEADS,
@@ -1696,15 +1683,14 @@ ca_model.train()
 
 
 #==============================================================================
-# Cell  89 [code] - Load CelebA train split & pre-extract features
+# Cell  87 [code] - Load CelebA train split & pre-extract features
 #==============================================================================
 
-CELEBA_TRAIN_ROOT = Path("/content/datasets")
 TRAIN_FEATS_PATH  = Path(EVALUATION_CACHE_DIR) / "train_embeddings.pt"
 
 # Load the full CelebA train split
-print(f"Loading CelebA train split from {CELEBA_TRAIN_ROOT} ...")
-celeba_train = CelebA(root=CELEBA_TRAIN_ROOT, split="train", download=False)
+print(f"Loading CelebA train split from {CELEBA_ROOT} ...")
+celeba_train = CelebA(root=CELEBA_ROOT, split="train", download=False)
 print(f"CelebA train split size: {len(celeba_train)}")
 
 # Pre-extract image features once and cache (shared utility, see encoding utilities)
@@ -1720,7 +1706,7 @@ n_attrs = train_labels_bool.shape[1]
 
 
 #==============================================================================
-# Cell  91 [code] - def desired_target_labels(source_labels: torch.Tensor, pos_idx: list[int], ne…
+# Cell  89 [code] - def desired_target_labels(source_labels: torch.Tensor, pos_idx: list[int], ne…
 #==============================================================================
 
 def desired_target_labels(source_labels: torch.Tensor, pos_idx: list[int], neg_idx: list[int]) -> torch.Tensor:
@@ -1824,7 +1810,7 @@ def find_hard_negative(source_labels: torch.Tensor, pos_idx: list[int], neg_idx:
 
 
 #==============================================================================
-# Cell  93 [code] - def build_condition_row(pos_idx: list[int], neg_idx: list[int], width: int) -…
+# Cell  91 [code] - def build_condition_row(pos_idx: list[int], neg_idx: list[int], width: int) -…
 #==============================================================================
 
 def build_condition_row(pos_idx: list[int], neg_idx: list[int], width: int) -> tuple[list[int], list[int]]:
@@ -1900,7 +1886,7 @@ def generate_triplet_pool(n_triplets: int, seed: int, log_every: int = 5000):
 
 
 #==============================================================================
-# Cell  95 [code] - def load_or_generate_triplets(n_triplets: int, seed: int, cache_path: str)
+# Cell  93 [code] - def load_or_generate_triplets(n_triplets: int, seed: int, cache_path: str)
 #==============================================================================
 
 def load_or_generate_triplets(n_triplets: int, seed: int, cache_path: str):
@@ -1971,7 +1957,7 @@ def train_patches_for(idx: torch.Tensor) -> torch.Tensor:
 
 
 #==============================================================================
-# Cell  97 [code] - Cross-Attention Fusion training setup
+# Cell  95 [code] - Cross-Attention Fusion training setup
 #==============================================================================
 
 model, _ = get_CLIP_model()
@@ -2032,7 +2018,7 @@ def ca_val_loss() -> float:
 
 
 #==============================================================================
-# Cell  99 [code] - def plot_training_curve(history: dict, title: str = "Cross-Attention Training…
+# Cell  97 [code] - def plot_training_curve(history: dict, title: str = "Cross-Attention Training…
 #==============================================================================
 
 def plot_training_curve(history: dict, title: str = "Cross-Attention Training Curve"):
@@ -2067,7 +2053,7 @@ def plot_training_curve(history: dict, title: str = "Cross-Attention Training Cu
 
 
 #==============================================================================
-# Cell 101 [code] - Train (or load cached) Cross-Attention model
+# Cell  99 [code] - Train (or load cached) Cross-Attention model
 #==============================================================================
 
 CA_CKPT = Path(EVALUATION_CACHE_DIR) / "cross_attn_patch.pt"
@@ -2151,10 +2137,10 @@ else:
 
 
 #==============================================================================
-# Cell 103 [code] - Cross-Attention gallery scorer
+# Cell 101 [code] - Cross-Attention gallery scorer
 #==============================================================================
 
-# Gallery visual tokens [CLS ; 49 patches] for the source side of retrieval. The gallery *target*
+# Gallery visual tokens (CLS + 49 patches) for the source side of retrieval. The gallery *target*
 # side stays the pooled, frozen ``gallery_embeddings``, so retrieval cost is unchanged; only the
 # query computation reads patches. Only the benchmark's *source* images are ever queried this way
 # (scorer/inspection both index by source_idx), so - mirroring the train-split pattern above
@@ -2190,7 +2176,7 @@ def query_to_condition_rows(text_query: str) -> tuple[torch.Tensor, torch.Tensor
     Returns:
         A (cond_attr, cond_sign) pair of (1, T) tensors, padded as needed.
     """
-    pos_idx, neg_idx = parse_query_signs(text_query)
+    pos_idx, neg_idx = query_to_signed_indices(text_query)
     width = max(MAX_TERMS, len(pos_idx) + len(neg_idx))
     attrs, signs = build_condition_row(pos_idx, neg_idx, width)
     cond_attr = torch.tensor([attrs], device=gallery_embeddings.device)
@@ -2250,7 +2236,7 @@ def cross_attn_scorer(gallery_embeddings: torch.Tensor, ca_model: nn.Module) -> 
 
 
 #==============================================================================
-# Cell 105 [code] - Evaluate & plot Cross-Attention Fusion
+# Cell 103 [code] - Evaluate & plot Cross-Attention Fusion
 #==============================================================================
 
 evaluation_results_ca, average_results_per_query_ca = evaluate_and_average(
@@ -2265,7 +2251,7 @@ plot_metrics_across_k(
 
 
 #==============================================================================
-# Cell 107 [code] - Qualitative attention inspection
+# Cell 105 [code] - Qualitative attention inspection
 #==============================================================================
 
 @torch.no_grad()
@@ -2328,7 +2314,7 @@ def plot_cross_attention_inspection(
     sims[source_idx] = -1.0                                   # Exclude the source itself
     topk = sims.topk(k).indices.tolist()
 
-    pos_idx, neg_idx = parse_query_signs(text_query)
+    pos_idx, neg_idx = query_to_signed_indices(text_query)
     gallery_bool = gallery_labels > 0                       # (N, 40) bool
     gt = set(ground_truth or [])
 
@@ -2389,7 +2375,7 @@ def first_query(annotations: list[dict], predicate: Callable) -> dict | None:
         The first matching annotation, or None.
     """
     for ann in annotations:
-        pos_idx, neg_idx = parse_query_signs(get_text_query(ann))
+        pos_idx, neg_idx = query_to_signed_indices(get_text_query(ann))
         if predicate(pos_idx, neg_idx):
             return ann
     return None
@@ -2421,7 +2407,7 @@ for kind, ann in inspection_queries:
 
 
 #==============================================================================
-# Cell 110 [code] - Aggregate results across all methods
+# Cell 108 [code] - Aggregate results across all methods
 #==============================================================================
 
 all_methods_results = {
