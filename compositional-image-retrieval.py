@@ -77,7 +77,6 @@ def _collate_keep_pil(batch):
     lbls = torch.stack([item[1] for item in batch], dim=0)
     return imgs, lbls
 
-
 @torch.no_grad()
 def _encode_image_batches(
     dataset,
@@ -87,18 +86,13 @@ def _encode_image_batches(
     batch_size: int = 64,
     num_workers: int = 4,
 ):
-    """Yield per-batch CLIP encodings for a dataset (optionally a subset), with progress logging.
-
-    Shared plumbing for get_encoded_dataset and get_encoded_patches: both build the same
-    PIL-preserving DataLoader over the (sub)dataset, push each batch through CLIP, and print
-    identical progress. They differ only in *what* they extract per batch (pooled, normalized
-    embedding vs. raw fp16 visual tokens) and in how they cache/accumulate it, so extraction is
-    injected as `encode_batch` and accumulation stays with the caller.
+    """Yield per-batch CLIP encodings for a dataset (optionally a subset).
 
     Args:
         dataset: Dataset yielding (image, label) pairs.
         device: Device the CLIP forward runs on.
-        encode_batch: Callable (model, processor, pil_images, device) -> (B, ...) CPU tensor.
+        encode_batch: Callable (model, inputs) -> (B, ...) CPU tensor, where `inputs` is the
+            CLIP processor output for the batch, already moved to `device`.
         indices: Optional subset of dataset indices to encode, in order. None encodes all.
         batch_size: DataLoader batch size.
         num_workers: DataLoader worker count.
@@ -118,47 +112,108 @@ def _encode_image_batches(
         collate_fn=_collate_keep_pil,
     )
 
-    n_total = len(source)
-    pad = len(str(n_total))
-    pos = 0
     for imgs_batch, lbls_batch in loader:
-        encoded = encode_batch(model, processor, list(imgs_batch), device)
-        pos += len(imgs_batch)
-        print(f"Encoded {pos:>{pad}}/{n_total} images ({100 * pos / n_total:.1f}%)")
-        yield encoded, lbls_batch
+        inputs = processor(images=imgs_batch, return_tensors="pt").to(device)
+        yield encode_batch(model, inputs), lbls_batch
 
-
-def _encode_pooled_batch(model, processor, pil_images: list, device) -> torch.Tensor:
-    """Encode a batch into pooled, projected, L2-normalized CLIP image embeddings.
+def _encode_pooled_batch(model, inputs) -> torch.Tensor:
+    """Encode a batch of prepared CLIP inputs into pooled, projected, L2-normalized image embeddings.
 
     Args:
         model: The CLIP model returned by get_CLIP_model().
-        processor: The CLIP processor returned by get_CLIP_model().
-        pil_images: PIL images to encode.
-        device: Device the CLIP forward runs on.
+        inputs: Processor output for the batch (e.g. pixel_values), already moved to device.
 
     Returns:
         A (B, D) CPU tensor, L2-normalized per row.
     """
-    inputs = processor(images=pil_images, return_tensors="pt").to(device)
     e = _as_feature_tensor(model.get_image_features(**inputs))
     return F.normalize(e, p=2, dim=-1).cpu()
 
 
-def _encode_token_batch(model, processor, pil_images: list, device) -> torch.Tensor:
-    """Encode a batch into CLIP's raw per-token visual sequence ``[CLS ; 49 patch]``.
+def _encode_token_batch(model, inputs) -> torch.Tensor:
+    """Encode a batch of prepared CLIP inputs into the raw per-token visual sequence ``[CLS ; 49 patch]``.
 
     Args:
         model: The CLIP model returned by get_CLIP_model().
-        processor: The CLIP processor returned by get_CLIP_model().
-        pil_images: PIL images to encode.
-        device: Device the CLIP forward runs on.
+        inputs: Processor output for the batch (e.g. pixel_values), already moved to device.
 
     Returns:
         A (B, 50, 768) fp16 CPU tensor, not L2-normalized.
     """
-    inputs = processor(images=pil_images, return_tensors="pt").to(device)
     return model.vision_model(pixel_values=inputs["pixel_values"]).last_hidden_state.half().cpu()
+
+def _collect_encoded(
+    batches, n_total: int, keep_labels: bool
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Stream-accumulate encoded batches into one preallocated CPU tensor, with progress logging.
+
+    Args:
+        batches: Iterable of (encoded_batch, labels_batch) pairs, e.g. from _encode_image_batches.
+        n_total: Total number of rows across all batches, for preallocation and progress.
+        keep_labels: Whether to also accumulate and return labels.
+
+    Returns:
+        An (encoded, labels) pair: encoded is (n_total, ...) on CPU; labels is the (n_total, ...)
+        concatenation of the label batches if `keep_labels`, else None.
+    """
+    encoded = None
+    labels_list: list[torch.Tensor] = []
+    pad = len(str(n_total))
+    pos = 0
+    for batch, lbls in batches:
+        if encoded is None:
+            encoded = torch.empty((n_total, *batch.shape[1:]), dtype=batch.dtype)
+        encoded[pos:pos + batch.shape[0]] = batch
+        if keep_labels:
+            labels_list.append(lbls)
+        pos += batch.shape[0]
+        print(f"Encoded {pos:>{pad}}/{n_total} images ({100 * pos / n_total:.1f}%)")
+
+    labels = torch.cat(labels_list, dim=0) if keep_labels else None
+    return encoded, labels
+
+
+def _load_or_encode(
+    cache_path: str,
+    encode_pass: Callable,
+    *,
+    is_fresh: Callable = lambda blob: True,
+    from_cache: Callable = lambda blob: blob,
+):
+    """Load cached data from `cache_path` if present and fresh, else encode, cache, and return it.
+
+    Shared skeleton for get_encoded_dataset and get_encoded_patches: ensures the cache directory
+    exists, loads and freshness-checks an existing cache, and otherwise runs `encode_pass`, saves
+    its result, and returns it.
+
+    Args:
+        cache_path: Path to load data from / save data to.
+        encode_pass: Callable () -> (blob, result); `blob` is the exact dict to `torch.save`,
+            `result` is what to return to the caller on a cache miss.
+        is_fresh: Callable (blob) -> bool deciding whether a loaded cache is still valid.
+            Defaults to always-fresh (no staleness guard).
+        from_cache: Callable (blob) -> result, extracting the return value from a loaded blob.
+
+    Returns:
+        Whatever `from_cache(blob)` (cache hit) or `encode_pass()`'s `result` (cache miss)
+        produces.
+    """
+    parent = os.path.dirname(cache_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+    if os.path.exists(cache_path):
+        blob = torch.load(cache_path, map_location="cpu")
+        if is_fresh(blob):
+            print(f"Loading cached data from {cache_path}.")
+            return from_cache(blob)
+        print(f"Cache {cache_path} is stale; regenerating.")
+
+    print("Cache not found / stale. Encoding...")
+    blob, result = encode_pass()
+    torch.save(blob, cache_path)
+    print(f"Saved to {cache_path}.")
+    return result
 
 
 @torch.no_grad()
@@ -186,30 +241,20 @@ def get_encoded_dataset(
         A (features, labels) pair: features (N, D) on `device`, L2-normalized per
         row; labels (N, ...) on CPU, as produced by the dataset.
     """
-    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+    def from_cache(blob):
+        feats, labels = blob["features"].to(device), blob["labels"]
+        print(f"features: {tuple(feats.shape)}, labels: {tuple(labels.shape)}")
+        return feats, labels
 
-    if os.path.exists(cache_path):
-        print(f"Loading cached features from {cache_path}.")
-        blob = torch.load(cache_path, map_location="cpu")
-        features = blob["features"].to(device)
-        labels   = blob["labels"]
-        print(f"Loaded from cache. features: {tuple(features.shape)}, labels: {tuple(labels.shape)}")
-        return features, labels
+    def encode_pass():
+        feats, labels = _collect_encoded(
+            _encode_image_batches(dataset, device, _encode_pooled_batch,
+                                   batch_size=batch_size, num_workers=num_workers),
+            n_total=len(dataset), keep_labels=True)
+        print(f"features: {tuple(feats.shape)}, labels: {tuple(labels.shape)}")
+        return {"features": feats, "labels": labels}, (feats.to(device), labels)
 
-    print("Cache not found. Encoding dataset...")
-    feats_list: list[torch.Tensor] = []
-    lbls_list:  list[torch.Tensor] = []
-    for e, lbls in _encode_image_batches(dataset, device, _encode_pooled_batch,
-                                          batch_size=batch_size, num_workers=num_workers):
-        feats_list.append(e)
-        lbls_list.append(lbls)
-
-    features = torch.cat(feats_list, dim=0).to(device)
-    labels   = torch.cat(lbls_list,  dim=0)
-
-    torch.save({"features": features.cpu(), "labels": labels}, cache_path)
-    print(f"Saved to {cache_path}. features: {tuple(features.shape)}, labels: {tuple(labels.shape)}")
-    return features, labels
+    return _load_or_encode(cache_path, encode_pass, from_cache=from_cache)
 
 
 @torch.no_grad()
@@ -228,8 +273,7 @@ def get_encoded_patches(
     patch tokens, giving the fusion module spatially grounded conditions. Tokens are stored in
     fp16 and are *not* L2-normalized, since they feed a learned projection rather than a cosine
     score. The returned bank is kept on CPU (it can be large); callers move the slices they need
-    onto the device; when loaded from cache it is memory-mapped, so only sliced rows enter RAM.
-    The cache records which dataset ``indices`` it covers so a stale subset can
+    onto the device. The cache records which dataset ``indices`` it covers so a stale subset can
     never be silently reused.
 
     Args:
@@ -244,34 +288,28 @@ def get_encoded_patches(
         A (len(indices) or N, 50, 768) fp16 tensor of visual tokens on CPU, row-aligned to
         `indices` (or to the dataset order when `indices` is None).
     """
-    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
     idx_list = list(range(len(dataset))) if indices is None else list(indices)
 
-    if os.path.exists(cache_path):
-        blob = torch.load(cache_path, map_location="cpu", mmap=True)
-        if blob.get("indices") == idx_list:
-            print(f"Loading cached patch tokens from {cache_path}.")
-            patches = blob["patches"]
-            print(f"Loaded from cache. patches: {tuple(patches.shape)}")
-            return patches
-        print(f"Patch cache {cache_path} covers different indices; regenerating.")
+    def is_fresh(blob):
+        cached_idx = blob.get("indices")
+        # Length check first: cheap, and short-circuits the full list comparison on the
+        # (common) case of a totally different subset.
+        return cached_idx is not None and len(cached_idx) == len(idx_list) and cached_idx == idx_list
 
-    print(f"Cache not found / stale. Encoding {len(idx_list)} images into visual tokens...")
-    n_total = len(idx_list)
-    patches = None
-    pos = 0
-    for tokens, _lbls in _encode_image_batches(dataset, device, _encode_token_batch,
-                                                indices=idx_list, batch_size=batch_size,
-                                                num_workers=num_workers):
-        if patches is None:
-            patches = torch.empty((n_total, tokens.shape[1], tokens.shape[2]), dtype=torch.float16)
-        patches[pos:pos + tokens.shape[0]] = tokens
-        pos += tokens.shape[0]
+    def from_cache(blob):
+        patches = blob["patches"]
+        print(f"patches: {tuple(patches.shape)}")
+        return patches
 
-    torch.save({"indices": idx_list, "patches": patches}, cache_path)
-    print(f"Saved to {cache_path}. patches: {tuple(patches.shape)}")
-    del patches
-    return torch.load(cache_path, map_location="cpu", mmap=True)["patches"]
+    def encode_pass():
+        patches, _ = _collect_encoded(
+            _encode_image_batches(dataset, device, _encode_token_batch, indices=idx_list,
+                                   batch_size=batch_size, num_workers=num_workers),
+            n_total=len(idx_list), keep_labels=False)
+        print(f"patches: {tuple(patches.shape)}")
+        return {"indices": idx_list, "patches": patches}, patches
+
+    return _load_or_encode(cache_path, encode_pass, is_fresh=is_fresh, from_cache=from_cache)
 
 
 #==============================================================================
@@ -2096,7 +2134,7 @@ $W_{\text{FiLM}}$ and $\mathbf{b}_{\text{FiLM}}$ are zero-initialised, so traini
 
 **2. Patch grounding.** Before the image weighs the conditions, the conditions read the source. The visual tokens are projected into the fusion space, $V=V_{\text{raw}}W_{\text{vis}}^{\top}\in\mathbb{R}^{50\times D}$, plus a two-row learned *type* embedding distinguishing the CLS token from the 49 patches (CLIP's positional embeddings already encode patch location). The conditions $C$ are then the target of a pre-norm Transformer-decoder layer with memory $V$:
 $$C\leftarrow C+\operatorname{SelfAttn}(\operatorname{LN}C),\quad C\leftarrow C+\operatorname{CrossAttn}(\operatorname{LN}C,\,V),\quad C\leftarrow C+\operatorname{FFN}(\operatorname{LN}C),$$
-so in one block the conditions co-adapt to one another and ground spatially on the source - `+Eyeglasses` can read the eye patches of *this* face rather than a generic direction. The grounded $C$ replaces the raw conditions below.
+so in one block the conditions co-adapt to one another - letting mutually exclusive or contradictory edits (e.g. `+Bald` and `+Bangs`) temper each other before the image ever reads them - and ground spatially on the source - `+Eyeglasses` can read the eye patches of *this* face rather than a generic direction. The grounded $C$ replaces the raw conditions below.
 
 **3. Stacked cross-attention** [(Vaswani et al., 2017)](https://arxiv.org/abs/1706.03762). The reference enters as a single query token $\mathbf{x}_0=\mathbf{v}_{\text{ref}}$ and is refined by $L=2$ pre-norm decoder layers reading from $C$, each with self-attention, cross-attention, and a feed-forward sublayer (dropout $p=0.1$):
 $$\mathbf{x}\leftarrow\mathbf{x}+\operatorname{SelfAttn}(\operatorname{LN}\mathbf{x}),\quad \mathbf{x}\leftarrow\mathbf{x}+\operatorname{CrossAttn}(\operatorname{LN}\mathbf{x},\,C),\quad \mathbf{x}\leftarrow\mathbf{x}+\operatorname{FFN}(\operatorname{LN}\mathbf{x}).$$
@@ -2135,9 +2173,10 @@ class CrossAttentionFusion(nn.Module):
     ``+attr`` and ``-attr`` become genuinely distinct, per-dimension vectors. Before the image
     weighs them, a *patch-grounding* stage lets the conditions read the source's frozen CLIP
     visual tokens ``[CLS ; 49 patches]`` (the global CLS summary plus the 49 spatial patches of a
-    ViT-B/32): the conditions self-attend (co-adapt to one another) and cross-attend over those
-    tokens, so a localized edit can latch onto the relevant region of *this* source rather than a
-    generic attribute direction. The image (a single query token) then attends over the grounded
+    ViT-B/32): the conditions self-attend (co-adapt to one another, tempering mutually exclusive or
+    contradictory edits before the image ever reads them) and cross-attend over those tokens, so a
+    localized edit can latch onto the relevant region of *this* source rather than a generic
+    attribute direction. The image (a single query token) then attends over the grounded
     conditions through a stack of pre-norm Transformer-decoder layers (cross-attention + GELU FFN +
     dropout). Finally a *gated residual head* fuses the attended vector back onto the reference:
     ``out = v_ref + sigmoid(gate) * delta``, so identity is preserved by default and the network
@@ -2225,8 +2264,9 @@ class CrossAttentionFusion(nn.Module):
         gamma, beta = self.film(self.sign_embed(sign_id)).chunk(2, dim=-1)  # (B, T, D) each
         conds = (1.0 + gamma) * attr + beta                                 # (B, T, D)
 
-        # 2. Patch grounding: project the source's visual tokens, tag CLS vs patch, and let
-        # the conditions self-attend (co-adapt) and cross-attend (ground spatially) over them.
+        # 2. Patch grounding: project the source's visual tokens, tag CLS vs patch, and let the
+        # conditions self-attend (co-adapt, tempering contradictory edits) and cross-attend
+        # (ground spatially) over them.
         V = self.vis_proj(vis_tokens.to(self.vis_proj.weight.dtype))        # (B, 50, D)
         type_id = torch.ones(V.shape[1], dtype=torch.long, device=V.device)
         type_id[0] = 0                                                      # position 0 is the global CLS token
