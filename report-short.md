@@ -1,6 +1,3 @@
-// TODO: 0) Along all the report, there is a quite high number of '-'. Try to avoid the use of them, and use instead a more formal writing style. Use commas, colons, and semicolons to separate clauses.
-Use '-' only when it is strictly necessary. Try to avoid compound modifiers unless they are technical terms.
-
 # Compositional Image Retrieval
 
 The project studies **compositional image retrieval** on CelebA: given a *source image* and a signed textual edit (`+attr` / `−attr`), the objective is to retrieve gallery images that preserve the source while applying the requested attribute changes.
@@ -16,7 +13,7 @@ We propose the following training-free methods for compositional image retrieval
 - **Source-Attribute Matching**: upgrades the *fusion mechanism*, replacing embedding arithmetic with explicit per-attribute comparison against the source in a calibrated similarity space.
 - **Prompt Ensembling**: upgrades only the *text bank*, leaving the scorer untouched, with an article-free adaptation of CLIP's ImageNet prompt ensemble.
 
-Before settling on a trained model, we also built and discarded two *learned* alternatives: prompt optimization via **CoOp** [(Zhou et al., 2022)](https://arxiv.org/abs/2109.01134) and concept editing via **Sparse Autoencoders** [(Gao et al., 2024)](https://arxiv.org/abs/2406.04093) - neither of which showed improvement over the multi-condition fusion problem.
+Before settling on a trained model, we also built and discarded two *learned* alternatives: prompt optimization via **CoOp** [(Zhou et al., 2022)](https://arxiv.org/abs/2109.01134) and concept editing via **Sparse Autoencoders** [(Gao et al., 2024)](https://arxiv.org/abs/2406.04093), neither of which showed improvement over the multi-condition fusion problem.
 
 Our main contribution, **Cross-Attention Fusion**, addresses this by dynamically modeling the interaction between the reference image and its sequence of signed textual conditions via cross-attention [(Vaswani et al., 2017)](https://arxiv.org/abs/1706.03762). Rather than statically combining condition embeddings prior to retrieval, this approach computes image-conditioned weights for each attribute, moving past the uniform, static weighting used in CLAY.
 
@@ -197,77 +194,60 @@ To achieve this adaptive combination, the source image is first processed at two
 
 The fusion process begins by passing each attribute vector $\mathbf{t}_a$ through **sign-aware FiLM conditioning** [(Perez et al., 2018)](https://arxiv.org/abs/1709.07871), a lightweight affine layer that rewrites each condition based on its positive or negative sign. Adding and removing a feature become distinct learned directions $\mathbf{c}_k$ rather than simple geometric mirror images.
 
-Next, these conditions $\mathbf{c}_k$ undergo **patch grounding**: acting as queries, they read the projected patch tokens $V$ through the cross-attention of a Transformer-decoder layer [(Vaswani et al., 2017)](https://arxiv.org/abs/1706.03762). Before this cross-attention, however, the conditions first **self-attend** to one another, allowing them to co-adapt and temper contradictory or overlapping edits — for instance, reconciling *"Wearing Lipstick"* with *"-Heavy Makeup"* into a consistent joint direction rather than letting the two pull independently against the image. Only this reconciled set of conditions is then anchored, via cross-attention, directly onto the specific region of the reference face it should physically alter.
+Next, these conditions $\mathbf{c}_k$ undergo **patch grounding**: acting as queries, they read the projected patch tokens $V$ through cross-attention [(Vaswani et al., 2017)](https://arxiv.org/abs/1706.03762). Before that, the conditions first co-adapt among themselves, tempering contradictory or overlapping edits: for instance, reconciling *"Wearing Lipstick"* with *"-Heavy Makeup"* into a consistent joint direction rather than letting the two pull independently against the image. Only this reconciled set of conditions is then anchored, via cross-attention, directly onto the specific region of the reference face it should physically alter.
 
-The core of the system relies on **stacked cross-attention**. The global image summary $\mathbf{v}_{\text{ref}}$ acts as the single query token, while the grounded, signed conditions $C$ serve as keys and values. In this setup, the image dynamically determines how strongly weight each requested edit based on its own identity. Stacking $L$ such decoder layers allows the image to iteratively read the conditions and update its representation, ultimately producing the attended vector $\mathbf{a}$.
+The core of the system relies on **stacked cross-attention**. The global image summary $\mathbf{v}_{\text{ref}}$ queries the grounded, signed conditions $C$, so the image dynamically determines how strongly to weight each requested edit based on its own identity. Stacking $L$ such layers lets the image iteratively read the conditions and update its representation, ultimately producing the attended vector $\mathbf{a}$.
 
 Finally, **gated-residual fusion** [(Vo et al., 2019)](https://arxiv.org/abs/1812.07119) applies this attended vector $\mathbf{a}$ as a signed correction $\boldsymbol{\delta}$, gated per-dimension by $\mathbf{g}$, directly onto the global identity vector $\mathbf{v}_{\text{ref}}$. This mechanism preserves the source's original identity by default while allowing targeted features to be genuinely removed, ultimately producing a single unit-norm query $\mathbf{q}$ ready to rank the gallery by cosine similarity.
 
 ![High-level architecture of the cross-attention fusion module](figures/architecture.svg)
 
 The following section provides a detailed breakdown of each individual component and the overall system architecture.
-//#TODO: 1) Note that in the deails explanation there are some repetitions of the high-level description. We should remove those to avoid redundancy.
 
-**Sign-aware FiLM conditioning** [(Perez et al., 2018)](https://arxiv.org/abs/1709.07871): This component processes an attribute vector $\mathbf{t}_{a_k}$ alongside its sign $s_k$. The sign indexes one of two learned vectors in a embedding table $E_{\text{sign}}$. A single affine layer then transforms this vector into a per-dimension scale $\boldsymbol{\gamma}_k$ and shift $\boldsymbol{\beta}_k$ to modulate the original attribute:
+**Sign-aware FiLM conditioning** [(Perez et al., 2018)](https://arxiv.org/abs/1709.07871): each attribute vector $\mathbf{t}_{a_k}$ is modulated by its sign $s_k$. The sign selects one of two learned vectors, which is mapped to a per-dimension scale $\boldsymbol{\gamma}_k$ and shift $\boldsymbol{\beta}_k$:
 
 $$\mathbf{c}_k=(\mathbf{1}+\boldsymbol{\gamma}_k)\odot\mathbf{t}_{a_k}+\boldsymbol{\beta}_k$$
 
-The underlying weights and biases ($W_{\text{FiLM}}$, $\mathbf{b}_{\text{FiLM}}$) are zero-initialized, meaning training safely starts from the raw CLIP vector ($\mathbf{c}_k=\mathbf{t}_{a_k}$) before gradually learning the modulation. Because this transformation is multiplicative and sign-specific, the positive and negative forms of an attribute become distinct, independent directions in the embedding space rather than mere mirror images. Stacked together, these modulated conditions form the system memory $C=[\mathbf{c}_1,\dots,\mathbf{c}_T]$. A boolean mask handles the padding slots, allowing downstream operations to seamlessly process varying numbers of attributes.
+The modulation is zero-initialized, so training starts from the raw CLIP vector ($\mathbf{c}_k=\mathbf{t}_{a_k}$) and only gradually bends it. The modulated conditions form the memory $C=[\mathbf{c}_1,\dots,\mathbf{c}_T]$.
 
-**Patch grounding** [(Vaswani et al., 2017)](https://arxiv.org/abs/1706.03762): This stage anchors the modulated conditions $C$ directly to the source image's visual tokens $V_{\text{raw}}$. 
-The visual tokens are projected into the fusion space and tagged with a learned type embedding to distinguish the CLS token from the patch tokens. 
-//#TODO: 2) Remove ALL THE REFERENCE TO Pytorch technical details AND ALL THE BOILERPLATE TECHNICAL DETAILS ABOUT THE TRANSFORMER LAYER. NOT ONLY HERE, BUT IN ALL THE REPORT. WE ARE NOT WRITING A Pytorch TUTORIAL, WE ARE WRITING A SCIENTIFIC PAPER.
-A pre-norm Transformer-decoder layer then refines the conditions in three steps, each with a distinct purpose. 
-- **Self-attention** lets the edits co-adapt, so multiple or conflicting requests (like `+Bald` and `+Bangs`) settle into a mutually consistent set before they touch the image. 
-- **Cross-attention** then has each condition read the image patches $V$, turning a generic attribute direction into one localized on the region of this specific face it should change, so `-Eyeglasses` grounds on the eye patches rather than acting everywhere. 
-- Finally, the **feed-forward sublayer** transforms each condition non-linearly, giving the block the capacity to blend these co-adapted and grounded signals into a single, richer edit representation.
+**Patch grounding** [(Vaswani et al., 2017)](https://arxiv.org/abs/1706.03762): the modulated conditions $C$ are anchored to the source image's visual tokens $V_{\text{raw}}$. The tokens are projected into the fusion space, and each condition reads them through cross-attention, so a generic attribute direction becomes localized on the region of this specific face it should change: `-Eyeglasses` grounds on the eye patches rather than acting everywhere. The grounded conditions $C$ then replace the raw conditions in every downstream stage.
 
-The resulting grounded conditions $C$ are now tied to the region of the face each edit should act on, and they replace the raw conditions in every downstream stage.
+**Stacked cross-attention** [(Vaswani et al., 2017)](https://arxiv.org/abs/1706.03762): the reference token $\mathbf{v}_{\text{ref}}$ reads the grounded conditions $C$ across $L$ cross-attention layers. With a single query token, each layer reduces to a content-based weighted average of the conditions, where the weights are set by the image itself. This is the per-image, per-condition weighting that fixed arithmetic cannot express. Stacking the layers refines this into the attended vector $\mathbf{a}$.
 
-**Stacked cross-attention** [(Vaswani et al., 2017)](https://arxiv.org/abs/1706.03762): This final stage fuses the reference token $\mathbf{v}_{\text{ref}}$ with the grounded conditions $C$ by passing the reference through $L$ identical pre-norm decoder layers. Within each layer, three sequential steps refine the token. 
-//#TODO: 3) DO WE REALLY need self attention on a single token? It seems like a waste of compute.
-- First, **self-attention** operates on the query side; because the reference is the sole token here, it transforms this single vector individually rather than mixing information across a sequence. 
-- Next, **cross-attention** allows the reference token to read the grounded conditions. It is run as multi-head attention, letting the image weigh the conditions in several representation subspaces in parallel, and because there is only one query token, the operation collapses into a content-based weighted average of the edits, dynamically weighted by the image itself. 
-- Finally, a **feed-forward sublayer** applies a non-linear transformation through a GELU activation. Unlike ReLU, keeps a gradient for negative inputs, providing the capacity to map these weighted edits into a coherent update. 
-
-Each sublayer is wrapped in a pre-norm residual connection, ensuring that any single layer only incrementally updates the reference. Stacking $L$ such layers enables the image to iteratively read the conditions, update its representation, and read them again. This process yields the final attended vector $\mathbf{a}$, which represents a tailored, per-image blend of the requested edits.
-
-**Gated-residual fusion** [(Vo et al., 2019)](https://arxiv.org/abs/1812.07119): This final stage applies the attended vector $\mathbf{a}$ to the reference $\mathbf{v}_{\text{ref}}$ as a targeted correction rather than a replacement. The two vectors are concatenated into $\mathbf{u}=[\mathbf{v}_{\text{ref}};\mathbf{a}]$ and processed by two parallel heads. The **edit head** (a **GELU MLP**) proposes *what* to change as a signed displacement $\boldsymbol{\delta}$, while the **gate head** (an affine layer with a sigmoid activation) determines *how much* to change via a per-dimension gate $\mathbf{g}\in(0,1)^{D}$. This gated displacement is added to the reference, and the result is projected back onto the unit sphere:
+**Gated-residual fusion** [(Vo et al., 2019)](https://arxiv.org/abs/1812.07119): the attended vector $\mathbf{a}$ is applied to the reference $\mathbf{v}_{\text{ref}}$ as a targeted correction rather than a replacement. From $\mathbf{a}$ and $\mathbf{v}_{\text{ref}}$, an edit head proposes *what* to change as a signed displacement $\boldsymbol{\delta}$, and a gate head decides *how much* to change through a per-dimension gate $\mathbf{g}\in(0,1)^{D}$. The gated displacement is added to the reference and projected back onto the unit sphere:
 
 $$\mathbf{q}=\Phi_\theta\big(\mathbf{v}_{\text{ref}},\{(a_k,s_k)\}\big)=\frac{\mathbf{v}_{\text{ref}}+\mathbf{g}\odot\boldsymbol{\delta}}{\lVert\mathbf{v}_{\text{ref}}+\mathbf{g}\odot\boldsymbol{\delta}\rVert_2}$$
 
-Once trained, the gate localizes edits to specific coordinates while leaving the rest of the reference intact. Ultimately, this additive correction produces a unit-norm query $\mathbf{q}$ on the unit sphere, allowing downstream image retrieval to reduce to a simple dot product.
+Once trained, the gate localizes edits to specific coordinates while leaving the rest of the reference intact, producing a unit-norm query $\mathbf{q}$ that reduces retrieval to a dot product.
 
 ![Detailed layer-by-layer architecture of the cross-attention fusion module](figures/architecture_details.svg)
 
 ---
 
 ### Training
-//#TODO: 4) Maybe add a 1-2 line comment introducing the training section.
+
+The module $\Phi_\theta$ is trained on top of frozen CLIP with label-free triplet supervision under a contrastive objective. We synthesize signed edit triplets, optimize an InfoNCE loss over them, and select the final checkpoint by early stopping on a held-out split.
 
 ![Label-free triplet supervision and the InfoNCE objective](figures/training.svg)
 
-**Triplet synthesis:** Each triplet originates from a random reference image $s$ with its corresponding binary attribute vector $\mathbf{b}_s$. A few attributes are randomly sampled and flipped to construct a signed edit query $q$. Applying these exact flips to the original vector yields the ideal target profile, $\mathbf{b}^\star$. 
-//#TODO: 5) Note that the t symbol is currently overloaded. Propose some other symbol for the target embedding (make sure to update also the code and the figure)
-The **positive target** $t$ is then drawn from real images that satisfy the query constraints while remaining within a strict Hamming distance budget of the ideal profile.
-//#TODO: 6) Underline why we use a Hamming distance budget -> matches the evaluation criteria and prevents the model from overfitting to unrealistic, perfect matches.
+**Triplet synthesis:** Each triplet originates from a random reference image $s$ with its corresponding binary attribute vector $\mathbf{b}_s$. A few attributes are randomly sampled and flipped to construct a signed edit query $q$. Applying these exact flips to the original vector yields the ideal target profile, $\mathbf{b}^\star$. The **positive target** $\mathbf{p}$ is then drawn from real images that satisfy the query while staying within a Hamming distance budget of the ideal profile. This budget matches the evaluation criteria, which allow a target up to two incidental attribute changes beyond the requested edit, and it keeps the model from overfitting to unrealistic, perfect matches.
 
-//#TODO: 7) This section has a few errors (e.g.,resembles the target in every respect except), the example is not well explained and not highlited. What is a distractor???
-
-**Hard negatives:** When enabled, one **constraint-violating** distractor $h$ is mined per query: a real image that satisfies every requested edit but one, which it violates. For the query `-Smiling`, this is a face that is otherwise valid yet still smiling. Because it resembles the target in every respect except the single edited attribute, using it as a negative forces the model to key on the requested change rather than on overall similarity to the source. It is the primary defense against the failure mode where the network simply returns look-alikes of the reference. When no such image exists for a query, that row falls back to its in-batch negatives alone.
-
-//#TODO: 8) Since the triplet synthesis is needed for the InfoNCE objective, should we move this section before?? Also, check that it is consistent with the code. Are we really using the optional hard negatives in the current implementation?
+**Hard negatives:** For each query we mine one **constraint-violating** target $h$: a real image that satisfies every requested edit except one, which it deliberately breaks, while staying within the Hamming budget. For the query `-Smiling`, the hard negative is a face that matches the target in every other respect but is still smiling. Ranking it below the true target forces the model to key on the requested change rather than on overall similarity to the source, which is the main defense against simply returning look-alikes of the reference.
 
 **InfoNCE objective** [(van den Oord et al., 2018)](https://arxiv.org/abs/1807.03748): To optimize the model, we employ the InfoNCE loss over a batch of $B$ triplets:
 
-$$\mathcal{L}=-\frac{1}{B}\sum_{i=1}^{B}\log\frac{\exp(\tau\,\mathbf{q}_i^{\top}\mathbf{t}_i)}{\displaystyle\sum_{j=1}^{B}\exp(\tau\,\mathbf{q}_i^{\top}\mathbf{t}_j)\;+\;\mathbb{1}[h_i\ \text{exists}]\,\exp(\tau\,\mathbf{q}_i^{\top}\mathbf{h}_i)}$$
+$$\mathcal{L}=-\frac{1}{B}\sum_{i=1}^{B}\log\frac{\exp(\tau\,\mathbf{q}_i^{\top}\mathbf{p}_i)}{\displaystyle\sum_{j=1}^{B}\exp(\tau\,\mathbf{q}_i^{\top}\mathbf{p}_j)\;+\;\mathbb{1}[h_i\ \text{exists}]\,\exp(\tau\,\mathbf{q}_i^{\top}\mathbf{h}_i)}$$
 
-Here, the fused query $\mathbf{q}_i$ is evaluated against its positive target $\mathbf{t}_i$, $B-1$ in-batch negative targets $\mathbf{t}_j$, and an optional hard negative $\mathbf{h}_i$ modulated by the indicator function $\mathbb{1}$. The frozen parameter $\tau$ scales the dot products according to CLIP's temperature.
-Minimizing $\mathcal{L}$ maximizes the similarity between the query and its true target while minimizing it against all negative distractors. 
+Here, the fused query $\mathbf{q}_i$ is evaluated against its positive target $\mathbf{p}_i$, $B-1$ in-batch negative targets $\mathbf{p}_j$, and an optional hard negative $\mathbf{h}_i$ modulated by the indicator function $\mathbb{1}$. The frozen parameter $\tau$ scales the dot products according to CLIP's temperature.
+Minimizing $\mathcal{L}$ maximizes the similarity between the query and its true target while minimizing it against the in-batch and hard negatives.
 
-**Optimisation:** We optimize the model using **AdamW** which is well-suited for this architecture. Because its per-parameter adaptive step sizes accommodate the diverse gradient scales of our heterogeneous modules, while decoupled weight decay provides effective regularization. The learning rate follows a **cosine-annealed schedule** over the epochs, decaying smoothly to zero to promote stable convergence. We use a large batch size to enrich the InfoNCE objective with a higher volume of in-batch contrastive negatives. To prevent overfitting on the synthetic triplets, we combine weight decay with a dropout rate in the decoder and fusion heads.
+**Optimization:** We optimize with **AdamW**: its per-parameter adaptive step sizes accommodate the diverse gradient scales of our heterogeneous modules, and decoupled weight decay provides regularization. The learning rate follows a **cosine-annealed schedule**, decaying smoothly to zero for stable convergence. A large batch size enriches the InfoNCE objective with more in-batch negatives. To prevent overfitting on the synthetic triplets, we combine weight decay with dropout in the decoder and fusion heads.
 
 **Early Stopping:** A held-out set of validation triplets is scored once per epoch with the same InfoNCE loss used for training, with a baseline value also recorded for the untrained model before the first epoch. Whenever the validation loss reaches a new minimum, we snapshot the module's weights as the current best and immediately write that checkpoint to disk, so an interrupted run loses at most the epochs since the last improvement.
+
+### Parameters
+
+The hyperparameters were chosen to lower the validation loss while limiting overfitting on the synthetic triplets, through various combinations of grid search and manual tuning. 
 
 ### Scorer
 
@@ -299,15 +279,29 @@ While our method shows clear progress, several architectural and semantic limita
 
 * **Conservative Editing Bias:** The architecture is designed to default to the reference image embedding to protect identity. Because preserving the original image is always the safest path for minimizing the contrastive loss, the model often chooses to under-edit strong requests rather than risk distorting the core identity of the subject.
 
-* **CoOp or Prompt Ensembling**
+* **Bare-Name Text Conditions:** The model relies on simple, single-word attribute embeddings, which only offer a weak estimate of each concept. Surprisingly, boosting these with prompt ensembling or CoOp didn't help. Both actually blurs the specific attribute directions that cross-attention needs, introducing unwanted noise.
 
-//#TODO: 9) The notebook introduced a cell about statistical significance testing. We should add a paragraph about it. Here are the results: How can we interpret this?
-Method A                     Method B                      R@10 A  R@10 B   A>B   B>A   p-value
-Baseline                     Source-Attribute Matching      0.127   0.132  2115  2277     0.015
-Source-Attribute Matching    Prompt Ensembling              0.132   0.135  2349  2421       0.3
-Prompt Ensembling            Cross-Attention                0.135   0.331  1961  8467         0
-Baseline                     Cross-Attention                0.127   0.331  1944  8684         0
+
+## Statistical Significance
+
+We test whether the Recall@10 gaps between methods are real with an exact **McNemar test** on paired per-(query, source) outcomes. Under the null hypothesis, we assume both methods are equally good, and then use a binomial test to see if the actual results stray significantly from that expectation.
+
+SAM improves significantly over the baseline ($p=0.015$), though the margin is small. Prompt Ensembling is not significant over Source-Attribute Matching ($p=0.30$). Cross-Attention is decisive against every training-free method ($p<0.001$), winning far more discordant pairs than it loses, which confirms that the jump comes from the learned fusion rather than from sampling variation.
+
 ---
 
 ## References
+
+1. **CLAY**: Lim et al. *CLAY: Conditional Visual Similarity Modulation in Vision-Language Embedding Space* 2026. [arXiv:2604.11539](https://arxiv.org/abs/2604.11539)
+2. **CLIP**: A. Radford, J. W. Kim, C. Hallacy, et al. *Learning Transferable Visual Models From Natural Language Supervision.* ICML 2021. [arXiv:2103.00020](https://arxiv.org/abs/2103.00020)
+3. **CoOp**: K. Zhou, J. Yang, C. C. Loy, Z. Liu. *Learning to Prompt for Vision-Language Models.* IJCV 2022. [arXiv:2109.01134](https://arxiv.org/abs/2109.01134)
+4. **TopK-SAE**: L. Gao, T. Dupré la Tour, H. Tillman, et al. *Scaling and Evaluating Sparse Autoencoders.* 2024. [arXiv:2406.04093](https://arxiv.org/abs/2406.04093)
+5. **Transformer**: A. Vaswani, N. Shazeer, N. Parmar, et al. *Attention Is All You Need.* NeurIPS 2017. [arXiv:1706.03762](https://arxiv.org/abs/1706.03762)
+6. **CelebA**: Z. Liu, P. Luo, X. Wang, X. Tang. *Deep Learning Face Attributes in the Wild.* ICCV 2015. [arXiv:1411.7766](https://arxiv.org/abs/1411.7766)
+7. **CLIP prompt templates**: OpenAI. *Prompt Engineering for ImageNet* (notebook). [GitHub](https://github.com/openai/CLIP/blob/main/notebooks/Prompt_Engineering_for_ImageNet.ipynb)
+8. **FiLM**: E. Perez, F. Strub, H. de Vries, V. Dumoulin, A. Courville. *FiLM: Visual Reasoning with a General Conditioning Layer.* AAAI 2018. [arXiv:1709.07871](https://arxiv.org/abs/1709.07871)
+9. **TIRG**: N. Vo, L. Jiang, C. Sun, et al. *Composing Text and Image for Image Retrieval - An Empirical Odyssey.* CVPR 2019. [arXiv:1812.07119](https://arxiv.org/abs/1812.07119)
+10. **InfoNCE / CPC**: A. van den Oord, Y. Li, O. Vinyals. *Representation Learning with Contrastive Predictive Coding.* 2018. [arXiv:1807.03748](https://arxiv.org/abs/1807.03748)
+11. **AdamW**: I. Loshchilov, F. Hutter. *Decoupled Weight Decay Regularization.* ICLR 2019. [arXiv:1711.05101](https://arxiv.org/abs/1711.05101)
+12. **SGDR (cosine annealing)** — I. Loshchilov, F. Hutter. *SGDR: Stochastic Gradient Descent with Warm Restarts.* ICLR 2017. [arXiv:1608.03983](https://arxiv.org/abs/1608.03983)
 
