@@ -5,8 +5,8 @@
 # Do *not* append `celeba/` to CELEBA_ROOT, the dataset class does that itself
 CELEBA_ROOT = Path("/content/datasets")
 BENCHMARK_ANNOTATIONS_PATH = Path("/content/drive/MyDrive/datasets/celeba_evaluation.json")
-EVALUATION_CACHE_DIR = "/content/drive/MyDrive/datasets/clip_cache"
-EVALUATION_CACHE_PATH = os.path.join(EVALUATION_CACHE_DIR, "embeddings.pt")
+EVALUATION_CACHE_DIR = Path("/content/drive/MyDrive/datasets/clip_cache")
+EVALUATION_CACHE_PATH = EVALUATION_CACHE_DIR / "embeddings.pt"
 
 
 #==============================================================================
@@ -165,7 +165,7 @@ def _encode_dataset(
     return encoded, labels
 
 def _load_or_encode(
-    cache_path: str,
+    cache_path: str | Path,
     encode_pass: Callable,
     *,
     from_cache: Callable = lambda blob: blob,
@@ -186,11 +186,10 @@ def _load_or_encode(
         Whatever `from_cache(blob)` (cache hit) or `encode_pass()`'s `result` (cache miss)
         produces.
     """
-    parent = os.path.dirname(cache_path)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
+    cache_path = Path(cache_path)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
 
-    if os.path.exists(cache_path):
+    if cache_path.exists():
         print(f"Loading cached data from {cache_path}.")
         return from_cache(torch.load(cache_path, map_location="cpu"))
 
@@ -204,7 +203,7 @@ def _load_or_encode(
 def get_encoded_dataset(
     dataset,
     device,
-    cache_path: str,
+    cache_path: str | Path,
     batch_size: int = 128,
     num_workers: int = 4,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -246,7 +245,7 @@ def get_encoded_dataset(
 def get_encoded_patches(
     dataset,
     device,
-    cache_path: str,
+    cache_path: str | Path,
     indices: list[int] | None = None,
     batch_size: int = 64,
     num_workers: int = 4,
@@ -292,6 +291,33 @@ def get_encoded_patches(
         return {"patches": patches}, patches
 
     return _load_or_encode(cache_path, encode_pass, from_cache=from_cache)
+
+def build_patch_bank(dataset, device, cache_path, source_indices: list[int], total_size: int) -> Callable:
+    """
+    Load visual tokens for a dataset subset and return an index-based getter.
+
+    Args:
+        dataset: Dataset yielding (image, label) pairs.
+        device: Device the CLIP encoding forward runs on.
+        cache_path: Path to load the token bank from / save it to.
+        source_indices: Original dataset indices to include in the bank.
+        total_size: Full dataset length, sizing the lookup table.
+
+    Returns:
+        ``patches_for(idx)``: maps (B,) original dataset indices (any device, must be in
+        `source_indices`) to a (B, 50, 768) fp16 token tensor on `idx`'s device.
+    """
+    # Load the cached visual tokens for the source indices, and build a lookup table
+    patches = get_encoded_patches(dataset, device, cache_path, indices=source_indices)
+    lookup = torch.full((total_size,), -1, dtype=torch.long)
+    lookup[torch.tensor(source_indices)] = torch.arange(len(source_indices))
+
+    def patches_for(idx: torch.Tensor) -> torch.Tensor:
+        """Gather cached CLIP visual tokens for original dataset indices."""
+        rows = lookup[idx.cpu()]
+        return patches[rows].to(idx.device)
+
+    return patches_for
 
 #==============================================================================
 # Cell  11 [code] - Shared attribute/query helpers (names, index maps, signed-query parser)
@@ -668,8 +694,6 @@ for attr, count, freq in zip(get_attributes(celeba), attr_counts, attr_freq):
 # Cell  22 [code] - Attribute name/index maps & retrieve_by_attributes
 #==============================================================================
 
-attr_names = get_attributes(celeba)
-
 def retrieve_by_attributes(query:dict):
     """Retrieve all dataset images that satisfy the given attribute conditions.
     Args:
@@ -837,7 +861,7 @@ _print_cosine_diagnostics(cos_mat)
 # Cell  36 [code] - Plot attribute cosine-similarity heatmap
 #==============================================================================
 
-plot_cosine_heatmap(cos_mat, attr_names)
+plot_cosine_heatmap(cos_mat, get_attributes())
 
 
 #==============================================================================
@@ -892,7 +916,7 @@ def mean_recall_at_10(evaluation_results: list[dict]) -> float:
         The mean Recall@10 across all (query, source image) pairs.
     """
     vals = [
-        metrics[10]["Recall@10"]
+        metrics["Recall@10"]
         for query_results in evaluation_results
         for metrics in query_results.values()
     ]
@@ -1022,7 +1046,8 @@ def evaluate(
         verbose: Whether to print per-query progress.
 
     Returns:
-        Per-query results as ``list[dict[source_idx -> dict[k -> metrics_dict]]]``.
+        Per-query results as ``list[dict[source_idx -> metrics_dict]]``, where each
+        metrics_dict maps "Recall@K" / "Precision@K" to its value for K in {1, 5, 10}.
     """
     results = []
     for i, annotation in enumerate(annotations):
@@ -1030,13 +1055,14 @@ def evaluate(
             print(f"Evaluating query Q{i+1}: {get_text_query(annotation)}")
         # Setup the scorer for this query
         scorer = make_scorer(annotation)
-        
+
         per_source = {}
         for src in get_source_image_idxs(annotation):
             retrieved = retrieve_topk(scorer(src), exclude_idx=src, k=10)
             per_source[src] = {
-                k: evaluate_retrieval(retrieved, get_target_indices(annotation, src), k)
+                name: value
                 for k in (1, 5, 10)
+                for name, value in evaluate_retrieval(retrieved, get_target_indices(annotation, src), k).items()
             }
         results.append(per_source)
     return results
@@ -1065,7 +1091,8 @@ def compute_query_average_results(query_evaluation_results: dict) -> dict:
     """Average Recall@K and Precision@K across a query's source images, for K in {1, 5, 10}.
 
     Args:
-        query_evaluation_results: Dict mapping source image index to its evaluation metrics for K in {1, 5, 10}.
+        query_evaluation_results: Dict mapping source image index to its flat metrics dict
+            (Recall@K / Precision@K for K in {1, 5, 10}).
 
     Returns:
         A dict of average Recall@K / Precision@K plus their 95% confidence intervals for the query.
@@ -1074,8 +1101,8 @@ def compute_query_average_results(query_evaluation_results: dict) -> dict:
 
     for k in [1, 5, 10]:
         # Collect the per-source Recall@K and Precision@K values for this query
-        recall_vals = [m[k][f"Recall@{k}"] for m in query_evaluation_results.values()]
-        precision_vals = [m[k][f"Precision@{k}"] for m in query_evaluation_results.values()]
+        recall_vals = [m[f"Recall@{k}"] for m in query_evaluation_results.values()]
+        precision_vals = [m[f"Precision@{k}"] for m in query_evaluation_results.values()]
 
         # Average each metric and attach its 95% confidence interval (empirical-std based; see
         # _mean_and_ci — the naive Bernoulli formula only applies to Recall, not Precision)
@@ -1151,11 +1178,185 @@ plot_metrics_across_k(average_results_per_query_baseline, title="Baseline Fusion
 
 
 #==============================================================================
+# Cell  55 [code] - Benchmark ground-truth rule (constants & label helpers)
+#==============================================================================
+
+# Both constants encode the benchmark's ground-truth rule, so they are shared by the
+# validation-query builder (training-free tuning) and the triplet synthesis (training-based).
+MAX_TERMS      = 3    # max attribute conditions per query (benchmark-dictated)
+HAMMING_BUDGET = 2    # max Hamming distance for a valid target (matches benchmark)
+
+
+def desired_target_labels(source_labels: torch.Tensor, pos_idx: list[int], neg_idx: list[int]) -> torch.Tensor:
+    """Compute the ideal target label vector for a source under a signed query.
+
+    Args:
+        source_labels: Boolean attribute-label vector of the source image.
+        pos_idx: Attribute indices the target must have.
+        neg_idx: Attribute indices the target must not have.
+
+    Returns:
+        The source labels with the queried attributes forced on/off.
+    """
+    target = source_labels.clone()
+    if pos_idx:
+        target[pos_idx] = True
+    if neg_idx:
+        target[neg_idx] = False
+    return target
+
+
+def query_satisfied(labels_bool: torch.Tensor, pos_idx: list[int], neg_idx: list[int]) -> torch.Tensor:
+    """Return a boolean mask of candidates satisfying a signed query.
+
+    A candidate satisfies the query if it has all the positive attributes and none of
+    the negative attributes, regardless of other attributes.
+
+    Args:
+        labels_bool: (N, n_attrs) boolean candidate label matrix.
+        pos_idx: Attribute indices a candidate must have.
+        neg_idx: Attribute indices a candidate must not have.
+
+    Returns:
+        An (N,) boolean mask, True where the candidate satisfies the query.
+    """
+    ok = torch.ones(labels_bool.shape[0], dtype=torch.bool, device=labels_bool.device)
+    if pos_idx:
+        ok &= labels_bool[:, pos_idx].all(dim=1)
+    if neg_idx:
+        ok &= (~labels_bool[:, neg_idx]).all(dim=1)
+    return ok
+
+
+def find_valid_targets(labels_bool: torch.Tensor, source_labels: torch.Tensor,
+                       pos_idx: list[int], neg_idx: list[int]) -> torch.Tensor:
+    """Return indices of valid target images for a source and query.
+
+    Valid targets satisfy the query and lie within HAMMING_BUDGET of the ideal target -
+    the exact rule the benchmark JSON was built with.
+
+    Args:
+        labels_bool: (N, n_attrs) boolean candidate label matrix.
+        source_labels: Boolean attribute-label vector of the source image.
+        pos_idx: Attribute indices the target must have.
+        neg_idx: Attribute indices the target must not have.
+
+    Returns:
+        Indices into `labels_bool` of the valid target images.
+    """
+    # Compute the ideal target attribute vector for this source and query
+    target = desired_target_labels(source_labels, pos_idx, neg_idx)
+    # First filter to candidates that satisfy the query and whose labels are within HAMMING_BUDGET
+    ok = query_satisfied(labels_bool, pos_idx, neg_idx)
+    hamming = (labels_bool != target.unsqueeze(0)).sum(dim=1)
+    return (ok & (hamming <= HAMMING_BUDGET)).nonzero(as_tuple=True)[0]
+
+
+#==============================================================================
 # Cell  56 [code] - Grid-search weight candidates
 #==============================================================================
 
 GRID_W_ATTR = [0.05, 0.1, 0.2, 0.4]   # attribute-proximity penalty weight candidates
 GRID_W_VISUAL  = [0.0, 0.5, 1.0]          # visual identity weight candidates
+
+
+#==============================================================================
+# Cell  57 [code] - Load CelebA train split & pre-extract features
+#==============================================================================
+
+# The train split serves two roles: it is the pool the tuning validation queries are built
+# from here (so the benchmark is never used for hyperparameter selection), and it is later
+# reused as the training corpus for the training-based method.
+TRAIN_FEATS_PATH = EVALUATION_CACHE_DIR / "train_embeddings.pt"
+
+# Load the full CelebA train split
+print(f"Loading CelebA train split from {CELEBA_ROOT} ...")
+celeba_train = CelebA(root=CELEBA_ROOT, split="train", download=False)
+print(f"CelebA train split size: {len(celeba_train)}")
+
+# Pre-extract image features once and cache
+train_embeddings, train_labels = get_encoded_dataset(
+    celeba_train, device, TRAIN_FEATS_PATH, batch_size=128
+)
+print(f"train_features dtype: {train_embeddings.dtype}, device: {train_embeddings.device}")
+
+train_labels_bool = (train_labels.to(device) > 0)        # (M, 40) on GPU, for candidate filtering
+train_labels_bool_np = train_labels_bool.cpu().numpy()   # CPU copy, for cheap per-sample query sampling
+TRAIN_N = train_labels_bool.shape[0]
+n_attrs = train_labels_bool.shape[1]
+
+
+#==============================================================================
+# Cell  58 [code] - Synthetic validation queries for hyperparameter tuning
+#==============================================================================
+
+VAL_QUERY_COUNT   = 36   # 3x the benchmark's query count, for a more robust hyperparameter estimate
+VAL_MAX_SOURCES   = 50   # cap sources per query to bound grid-search cost
+VAL_MIN_TARGETS   = 5    # benchmark rule: a source needs >= 5 valid targets
+VAL_SOURCE_TRIES  = 2000 # sampled source candidates per query before giving up
+
+
+def build_validation_annotations(
+    labels_bool: torch.Tensor,
+    n_queries: int,
+    seed: int,
+    max_sources: int = VAL_MAX_SOURCES,
+    min_targets: int = VAL_MIN_TARGETS,
+    source_tries: int = VAL_SOURCE_TRIES,
+) -> list[dict]:
+    """
+    Build benchmark-shaped annotations from random signed queries over a label pool.
+
+    Mirrors the benchmark construction: each annotation pairs a signed query with sources
+    that have at least `min_targets` valid targets under the Hamming rule
+    (find_valid_targets). 
+    Emitting the exact benchmark JSON shape means evaluate() and every scorer factory 
+    can be reused unchanged for hyperparameter tuning.
+
+    Args:
+        labels_bool: (N, n_attrs) boolean label matrix of the pool (e.g. the train split).
+        n_queries: Number of annotations to build; term counts cycle 1..MAX_TERMS so the
+            complexity mix mirrors the benchmark's simple and composed queries.
+        seed: Seed for the random generator.
+        max_sources: Max sources kept per query.
+        min_targets: Min valid targets a source needs to be kept.
+        source_tries: Random source candidates examined per query.
+
+    Returns:
+        A list of `{"query": ..., "ground_truth": {str(src): [targets...]}}` dicts.
+    """
+    rng = np.random.default_rng(seed)
+    names = get_attributes()
+    annotations_out = []
+    while len(annotations_out) < n_queries:
+        # Cycle 1..MAX_TERMS terms and draw a random sign per attribute
+        n_terms = 1 + len(annotations_out) % MAX_TERMS
+        attrs = [int(j) for j in rng.choice(labels_bool.shape[1], size=n_terms, replace=False)]
+        term_signs = rng.integers(0, 2, size=n_terms)
+        pos_idx = [a for a, s in zip(attrs, term_signs) if s == 1]
+        neg_idx = [a for a, s in zip(attrs, term_signs) if s == 0]
+
+        # Keep sampled sources that have enough valid targets under the benchmark rule
+        ground_truth = {}
+        for s in rng.choice(labels_bool.shape[0], size=source_tries, replace=False):
+            targets = find_valid_targets(labels_bool, labels_bool[int(s)], pos_idx, neg_idx)
+            targets = targets[targets != int(s)]
+            if targets.numel() >= min_targets:
+                ground_truth[str(int(s))] = targets.tolist()
+            if len(ground_truth) >= max_sources:
+                break
+        if not ground_truth:
+            continue   # degenerate query (e.g. contradictory attributes) — resample
+
+        query = ", ".join([f"+{names[j]}" for j in pos_idx] + [f"-{names[j]}" for j in neg_idx])
+        annotations_out.append({"query": query, "ground_truth": ground_truth})
+    return annotations_out
+
+
+val_annotations = build_validation_annotations(train_labels_bool, VAL_QUERY_COUNT, seed=12)
+print(f"Built {len(val_annotations)} validation queries:")
+for ann in val_annotations:
+    print(f"  {get_text_query(ann):<45} sources: {len(ann['ground_truth'])}")
 
 
 #==============================================================================
@@ -1239,11 +1440,11 @@ def attribute_matching_scorer(
         queried   = set(pos_idx + neg_idx)
         unqueried = [j for j in range(Z.shape[1]) if j not in queried]
         constraint = Z[:, pos_idx].sum(dim=1) - Z[:, neg_idx].sum(dim=1)  # (N,)
+        Z_unq = Z[:, unqueried]  # gathered once per query; the per-source loop only slices rows
 
         def scorer(source_idx: int) -> torch.Tensor:
             """Score every gallery image by constraint, attribute proximity, and visual similarity."""
-            z_src   = Z[source_idx]
-            attr_proximity = ((Z[:, unqueried] - z_src[unqueried]) ** 2).sum(dim=1)
+            attr_proximity = ((Z_unq - Z_unq[source_idx]) ** 2).sum(dim=1)
             scores  = w_query * constraint - w_attr * attr_proximity
             if w_visual > 0:
                 scores = scores + w_visual * (gallery_embeddings @ gallery_embeddings[source_idx])
@@ -1254,23 +1455,25 @@ def attribute_matching_scorer(
 
 
 #==============================================================================
-# Cell  62 [code] - Grid search over fusion weights
+# Cell  62 [code] - Grid search over fusion weights (on the validation queries)
 #==============================================================================
 
+# The grid is scored on the synthetic train-split validation queries, never on the
+# benchmark: the selected weights are frozen here and only then reported on the benchmark.
 grid_rows = []
 for w_p in GRID_W_ATTR:
     for w_v in GRID_W_VISUAL:
         res = evaluate(
-            annotations,
-            attribute_matching_scorer(gallery_embeddings, get_attribute_name_embeddings(device), w_query=1.0, w_attr=w_p, w_visual=w_v),
+            val_annotations,
+            attribute_matching_scorer(train_embeddings, get_attribute_name_embeddings(device), w_query=1.0, w_attr=w_p, w_visual=w_v),
             verbose=False,
         )
         r10 = mean_recall_at_10(res)
         grid_rows.append((w_p, w_v, r10))
-        print(f"w_attr={w_p:<5} w_visual={w_v:<4} mean Recall@10={r10:.4f}")
+        print(f"w_attr={w_p:<5} w_visual={w_v:<4} mean val Recall@10={r10:.4f}")
 
 best_w_attr, best_w_visual, best_r10 = max(grid_rows, key=lambda row: row[2])
-print(f"\nBest: w_attr={best_w_attr}, w_visual={best_w_visual} (mean Recall@10={best_r10:.4f})")
+print(f"\nBest: w_attr={best_w_attr}, w_visual={best_w_visual} (mean val Recall@10={best_r10:.4f})")
 SAM_WEIGHTS = dict(w_query=1.0, w_attr=best_w_attr, w_visual=best_w_visual)
 
 
@@ -1460,7 +1663,7 @@ def precompute_attribute_description_embeddings() -> tuple[torch.Tensor, torch.T
         An (E_pos, E_neg) pair, each (40, 512) and L2-normalized.
     """
     pos_embs, neg_embs = [], []
-    for attribute_name in attr_names:
+    for attribute_name in get_attributes():
         # Retrieve the positive and negative natural-language descriptions for this attribute
         pos_descriptions = attribute_descriptions_pos[attribute_name]
         neg_descriptions = attribute_descriptions_neg[attribute_name]
@@ -1520,9 +1723,6 @@ CA_BATCH          = 512        # mini-batch size
 CA_LR             = 2e-4       # AdamW learning rate
 CA_WD             = 1e-2       # AdamW weight decay
 
-MAX_TERMS         = 3          # max attribute conditions per synthetic query (benchmark-dictated)
-HAMMING_BUDGET    = 2          # max Hamming distance for a valid target (matches benchmark)
-
 CA_FILM_SIGN_STD  = 0.02       # FiLM sign-embedding init std
 CA_GATE_BIAS_INIT = 2.0        # gated-residual gate-open bias; sigmoid(2.0)≈0.88 keeps gate open
 
@@ -1532,18 +1732,10 @@ CA_GATE_BIAS_INIT = 2.0        # gated-residual gate-open bias; sigmoid(2.0)≈0
 #==============================================================================
 
 class CrossAttentionFusion(nn.Module):
-    """Cross-attention fusion: the source image queries its sign-tagged conditions and the
-    attended result is fused back onto the image embedding. See the "Training-Based Method:
-    Cross-Attention Fusion" section of the report for the full architecture rationale.
-
-    Pipeline, per forward pass:
-      1. Sign-aware FiLM: ``conds = (1 + gamma) * attr_name + beta``, with ``(gamma, beta)``
-         produced per sign, so ``+attr`` and ``-attr`` become distinct per-dimension vectors.
-      2. Patch grounding: conditions self-attend, then cross-attend over the source's CLIP
-         visual tokens (CLS + 49 patches).
-      3. The image (a single query token) attends over the grounded conditions through a
-         stack of pre-norm Transformer-decoder layers.
-      4. Gated residual head: ``out = v_ref + sigmoid(gate) * delta``.
+    """
+    Cross-attention fusion: the source image queries its sign-tagged conditions. The
+    attended result is fused back onto the image embedding.
+    See the "Training-Based Method: Cross-Attention Fusion" section of the report for the full architecture rationale.
     """
 
     def __init__(self, attr_name_embs: torch.Tensor, dim: int, n_heads: int = 4,
@@ -1551,7 +1743,6 @@ class CrossAttentionFusion(nn.Module):
                  film_sign_std: float = 0.02, gate_bias_init: float = 2.0,
                  clip_dim: int = 768, ground_layers: int = 1, ground_heads: int = 4):
         """Build the cross-attention fusion module.
-
         Args:
             attr_name_embs: (n_attrs, D) frozen cleaned attribute-name CLIP text bank.
             dim: Embedding dimension D.
@@ -1567,28 +1758,29 @@ class CrossAttentionFusion(nn.Module):
         """
         super().__init__()
 
-        # Freeze the cleaned attribute-name CLIP text bank (one vector per attribute) for cross-attention
-        self.register_buffer("attr_name", attr_name_embs)  # (n_attrs, D) frozen CLIP text
+        # Frozen cleaned attribute-name CLIP text bank, indexed per condition in forward()
+        self.register_buffer("attr_name", attr_name_embs)  # (n_attrs, D)
 
-        # Sign embedding: each sign (+/-) gets a learned per-dimension vector (gamma, beta) for FiLM
-        self.sign_embed = nn.Embedding(2, dim)             # 0: +   1: -
+        # Sign embedding: each sign (+/-) gets a learned vector for FiLM modulation
+        self.sign_embed = nn.Embedding(2, dim)              # weight: (2, D)   [0: +, 1: -]
         nn.init.normal_(self.sign_embed.weight, std=film_sign_std)
 
-        # Sign-conditioned FiLM: each sign yields a per-dimension (gamma, beta) over the attribute
-        self.film = nn.Linear(dim, 2 * dim)
-        nn.init.zeros_(self.film.weight)
-        nn.init.zeros_(self.film.bias)
+        # Sign-conditioned FiLM: maps a sign embedding (D) to a per-dim scale + shift (2D),
+        # letting "+" and "-" modulate the same frozen attribute vector in opposite, learned ways
+        self.film = nn.Linear(dim, 2 * dim)                 # (B, T, D) -> (B, T, 2D)
+        nn.init.zeros_(self.film.weight)    # gamma
+        nn.init.zeros_(self.film.bias)      # beta
 
-        # Patch grounding: project the frozen CLIP visual tokens into the fusion space and tag the
-        # CLS token apart from the 49 patches, then let the conditions read them.
-        self.vis_proj = nn.Linear(clip_dim, dim)
-        self.vis_type = nn.Embedding(2, dim)               # 0: CLS (position 0)   1: patch
+        # Patch grounding: project frozen CLIP visual tokens back into the fusion dimension
+        self.vis_proj = nn.Linear(clip_dim, dim)             # (B, 50, clip_dim) -> (B, 50, D)
+        self.vis_type = nn.Embedding(2, dim)                 # weight: (2, D)   [0: CLS, 1: patch]
         nn.init.normal_(self.vis_type.weight, std=film_sign_std)
         ground_layer = nn.TransformerDecoderLayer(
             dim, ground_heads, dim_feedforward=ffn_mult * dim, dropout=dropout,
             activation="gelu", batch_first=True, norm_first=True,
         )
         self.ground = nn.TransformerDecoder(ground_layer, num_layers=ground_layers)
+        # tgt: (B, T, D) conditions, memory: (B, 50, D) grounded visual tokens -> (B, T, D)
 
         # Stacked cross-attention: image (1 query token) attends over the grounded conditions
         layer = nn.TransformerDecoderLayer(
@@ -1596,12 +1788,14 @@ class CrossAttentionFusion(nn.Module):
             activation="gelu", batch_first=True, norm_first=True,
         )
         self.decoder = nn.TransformerDecoder(layer, num_layers=n_layers)
+        # tgt: (B, 1, D) image query, memory: (B, T, D) conditions -> (B, 1, D)
 
         # Gated residual head: a sigmoid gate weighs a non-linear delta added back onto v_ref
         self.delta = nn.Sequential(
             nn.Linear(2 * dim, dim), nn.GELU(), nn.Dropout(dropout), nn.Linear(dim, dim),
-        )
+        )                                                   # (B, 2D) -> (B, D)
         self.gate = nn.Sequential(nn.Linear(2 * dim, dim), nn.Sigmoid())
+                                                                # (B, 2D) -> (B, D), in (0, 1)
 
         # Gate starts open (sigmoid(2) ~ 0.88) so the non-zero delta head receives gradient
         nn.init.constant_(self.gate[0].bias, gate_bias_init)
@@ -1620,34 +1814,41 @@ class CrossAttentionFusion(nn.Module):
         Returns:
             A (B, D) L2-normalized fused embedding.
         """
-        pad_mask = cond_sign == 0             # (B, T) True = ignore
-        sign_id  = (cond_sign < 0).long()     # 0 for +, 1 for - (padding -> 0, masked anyway)
+        pad_mask = cond_sign == 0             # (B, T) bool, True = ignore
+        sign_id  = (cond_sign < 0).long()     # (B, T) in {0, 1}; padding -> 0 (masked anyway)
         attr     = self.attr_name[cond_attr]  # (B, T, D) frozen text
 
-        # 1. Sign-aware FiLM: each sign modulates the attribute's text vector per-dimension
-        gamma, beta = self.film(self.sign_embed(sign_id)).chunk(2, dim=-1)  # (B, T, D) each
-        conds = (1.0 + gamma) * attr + beta                                 # (B, T, D)
+        # 1. Sign-aware FiLM: look up each condition's sign embedding, then run it through a
+        # single Linear(D, 2D) whose output is split into a per-dimension scale (gamma) and
+        # shift (beta). This lets "+" and "-" modulate the same frozen attribute text vector
+        # in opposite, learned ways instead of just negating it.
+        sign_emb    = self.sign_embed(sign_id)                    # (B, T, D)
+        gamma, beta = self.film(sign_emb).chunk(2, dim=-1)        # (B, T, D) each
+        conds       = (1.0 + gamma) * attr + beta                 # (B, T, D)
 
         # 2. Patch grounding: project the source's visual tokens, tag CLS vs patch, and let the
         # conditions self-attend (co-adapt, tempering contradictory edits) and cross-attend
         # (ground spatially) over them.
-        V = self.vis_proj(vis_tokens.to(self.vis_proj.weight.dtype))        # (B, 50, D)
-        type_id = torch.ones(V.shape[1], dtype=torch.long, device=V.device)
-        type_id[0] = 0                                                      # position 0 is the CLS token
-        V = V + self.vis_type(type_id)                                      # broadcast over batch
-        conds = self.ground(conds, V, tgt_key_padding_mask=pad_mask)        # (B, T, D) grounded
+        V = self.vis_proj(vis_tokens.to(self.vis_proj.weight.dtype))         # (B, 50, D)
+        type_id = torch.ones(V.shape[1], dtype=torch.long, device=V.device)  # (50,)
+        type_id[0] = 0                                                       # position 0 is the CLS token
+        V = V + self.vis_type(type_id)                                       # (B, 50, D), broadcast over batch
+        conds = self.ground(conds, V, tgt_key_padding_mask=pad_mask)         # (B, T, D) grounded
 
         # 3. Stacked cross-attention: the image (1 query token) reads the grounded conditions
-        q = img_emb.unsqueeze(1)                                            # (B, 1, D)
-        attended = self.decoder(q, conds, memory_key_padding_mask=pad_mask) # (B, 1, D)
-        attended = attended.squeeze(1)                                      # (B, D)
+        q        = img_emb.unsqueeze(1)                                      # (B, 1, D)
+        attended = self.decoder(q, conds, memory_key_padding_mask=pad_mask)  # (B, 1, D)
+        attended = attended.squeeze(1)                                       # (B, D)
 
         # 4. Gated-residual fusion: v_ref preserved by default, delta can add or subtract
-        fused = torch.cat([img_emb, attended], dim=-1)        # (B, 2D)
-        out = img_emb + self.gate(fused) * self.delta(fused)  # (B, D)
-        return F.normalize(out, dim=-1)
+        fused = torch.cat([img_emb, attended], dim=-1)   # (B, 2D)
+        gate  = self.gate(fused)                         # (B, D), in (0, 1)
+        delta = self.delta(fused)                        # (B, D)
+        out   = img_emb + gate * delta                   # (B, D)
+        return F.normalize(out, dim=-1)                  # (B, D), L2-normalized
 
 
+# Instantiate the cross-attention fusion model
 ca_model = CrossAttentionFusion(
     get_attribute_name_embeddings(device), gallery_embeddings.shape[1],
     n_heads=CA_HEADS, n_layers=CA_LAYERS, ffn_mult=CA_FFN_MULT, dropout=CA_DROPOUT,
@@ -1655,6 +1856,9 @@ ca_model = CrossAttentionFusion(
     clip_dim=CLIP_VIS_DIM, ground_layers=CA_GROUND_LAYERS, ground_heads=CA_GROUND_HEADS,
 ).to(device)
 
+#==============================================================================
+# NEW CELL, TO BE ADDED TO THE NOTEBOOK
+#==============================================================================
 n_params = sum(p.numel() for p in ca_model.parameters() if p.requires_grad)
 print(f"Cross-Attention trainable parameters: {n_params:,}")
 
@@ -1664,7 +1868,7 @@ with torch.no_grad():
     _b    = 4
     _img  = F.normalize(torch.randn(_b, gallery_embeddings.shape[1], device=device), dim=-1)
     _vis  = torch.randn(_b, 50, CLIP_VIS_DIM, device=device)
-    _attr = torch.randint(0, len(attr_names), (_b, 3), device=device)
+    _attr = torch.randint(0, len(get_attributes()), (_b, 3), device=device)
     _sign = torch.tensor([[1, -1, 0], [1, 0, 0], [-1, -1, 1], [1, 1, -1]], device=device)
     _out  = ca_model(_img, _vis, _attr, _sign)
 
@@ -1676,95 +1880,11 @@ ca_model.train()
 
 
 #==============================================================================
-# Cell  87 [code] - Load CelebA train split & pre-extract features
+# Cell  89 [code] - def find_hard_negative(labels_bool, source_labels, pos_idx, neg_idx, ...)
 #==============================================================================
 
-TRAIN_FEATS_PATH  = Path(EVALUATION_CACHE_DIR) / "train_embeddings.pt"
-
-# Load the full CelebA train split
-print(f"Loading CelebA train split from {CELEBA_ROOT} ...")
-celeba_train = CelebA(root=CELEBA_ROOT, split="train", download=False)
-print(f"CelebA train split size: {len(celeba_train)}")
-
-# Pre-extract image features once and cache (shared utility, see encoding utilities)
-train_embeddings, train_labels = get_encoded_dataset(
-    celeba_train, device, str(TRAIN_FEATS_PATH), batch_size=128
-)
-print(f"train_features dtype: {train_embeddings.dtype}, device: {train_embeddings.device}")
-
-train_labels_bool = (train_labels.to(device) > 0)   # (M, 40) on GPU, for candidate filtering
-train_labels_bool_np = train_labels_bool.cpu().numpy()   # CPU copy, for cheap per-sample query sampling
-TRAIN_N = train_labels_bool.shape[0]
-n_attrs = train_labels_bool.shape[1]
-
-
-#==============================================================================
-# Cell  89 [code] - def desired_target_labels(source_labels: torch.Tensor, pos_idx: list[int], ne…
-#==============================================================================
-
-def desired_target_labels(source_labels: torch.Tensor, pos_idx: list[int], neg_idx: list[int]) -> torch.Tensor:
-    """Compute the ideal target label vector for a source under a signed query.
-
-    Args:
-        source_labels: Boolean attribute-label vector of the source image.
-        pos_idx: Attribute indices the target must have.
-        neg_idx: Attribute indices the target must not have.
-
-    Returns:
-        The source labels with the queried attributes forced on/off.
-    """
-    target = source_labels.clone()
-    if pos_idx:
-        target[pos_idx] = True
-    if neg_idx:
-        target[neg_idx] = False
-    return target
-
-
-def query_satisfied(labels_bool: torch.Tensor, pos_idx: list[int], neg_idx: list[int]) -> torch.Tensor:
-    """Return a boolean mask of candidates satisfying a signed query.
-
-    A candidate satisfies the query if it has all the positive attributes and none of
-    the negative attributes, regardless of other attributes.
-
-    Args:
-        labels_bool: (N, n_attrs) boolean candidate label matrix.
-        pos_idx: Attribute indices a candidate must have.
-        neg_idx: Attribute indices a candidate must not have.
-
-    Returns:
-        An (N,) boolean mask, True where the candidate satisfies the query.
-    """
-    ok = torch.ones(labels_bool.shape[0], dtype=torch.bool, device=labels_bool.device)
-    if pos_idx:
-        ok &= labels_bool[:, pos_idx].all(dim=1)
-    if neg_idx:
-        ok &= (~labels_bool[:, neg_idx]).all(dim=1)
-    return ok
-
-
-def find_valid_targets(source_labels: torch.Tensor, pos_idx: list[int], neg_idx: list[int]) -> torch.Tensor:
-    """Return indices of valid target images for a source and query.
-
-    Valid targets satisfy the query and lie within HAMMING_BUDGET of the ideal target.
-
-    Args:
-        source_labels: Boolean attribute-label vector of the source image.
-        pos_idx: Attribute indices the target must have.
-        neg_idx: Attribute indices the target must not have.
-
-    Returns:
-        Indices into the training features of the valid target images.
-    """
-    # Compute the ideal target attribute vector for this source and query
-    target = desired_target_labels(source_labels, pos_idx, neg_idx)
-    # First filter to candidates that satisfy the query and whose labels are within HAMMING_BUDGET
-    ok = query_satisfied(train_labels_bool, pos_idx, neg_idx)
-    hamming = (train_labels_bool != target.unsqueeze(0)).sum(dim=1)
-    return (ok & (hamming <= HAMMING_BUDGET)).nonzero(as_tuple=True)[0]
-
-
-def find_hard_negative(source_labels: torch.Tensor, pos_idx: list[int], neg_idx: list[int],
+def find_hard_negative(labels_bool: torch.Tensor, source_labels: torch.Tensor,
+                       pos_idx: list[int], neg_idx: list[int],
                        source_idx: int, rng) -> int:
     """Return the index of a hard negative for a source and query.
 
@@ -1772,6 +1892,7 @@ def find_hard_negative(source_labels: torch.Tensor, pos_idx: list[int], neg_idx:
     Returns -1 when the query is empty or no candidate qualifies.
 
     Args:
+        labels_bool: (N, n_attrs) boolean candidate label matrix.
         source_labels: Boolean attribute-label vector of the source image.
         pos_idx: Attribute indices the (satisfied) query would require present.
         neg_idx: Attribute indices the (satisfied) query would require absent.
@@ -1784,16 +1905,17 @@ def find_hard_negative(source_labels: torch.Tensor, pos_idx: list[int], neg_idx:
     queried = pos_idx + neg_idx
     if not queried:
         return -1
+    
     # Compute the ideal target attribute vector for this source and query
     target = desired_target_labels(source_labels, pos_idx, neg_idx)
     # Randomly select one of the queried attributes to violate
-    j = int(rng.choice(queried)) 
+    j = int(rng.choice(queried))
     violated = target.clone()
     violated[j] = ~violated[j] # Break the query on attribute j
 
     # Filter to candidates that violate the query on attribute j and are within HAMMING_BUDGET of the source
-    ok = (train_labels_bool[:, queried] == violated[queried].unsqueeze(0)).all(dim=1)
-    ok &= (train_labels_bool != violated.unsqueeze(0)).sum(dim=1) <= HAMMING_BUDGET
+    ok = (labels_bool[:, queried] == violated[queried].unsqueeze(0)).all(dim=1)
+    ok &= (labels_bool != violated.unsqueeze(0)).sum(dim=1) <= HAMMING_BUDGET
     # Exclude the source image itself from the candidates
     cand = ok.nonzero(as_tuple=True)[0]
     cand = cand[cand != source_idx]
@@ -1829,9 +1951,6 @@ def build_condition_row(pos_idx: list[int], neg_idx: list[int], width: int) -> t
 def generate_triplet_pool(n_triplets: int, seed: int, log_every: int = 5000):
     """Sample a pool of (source, target, cond_attr, cond_sign, hard) triplet rows.
 
-    cond_attr / cond_sign are fixed-width (MAX_TERMS,) rows; sign 0 marks padding.
-    hard is one constraint-violating hard negative per row (-1 if none found).
-
     Args:
         n_triplets: Number of triplet rows to sample.
         seed: Seed for the random generator.
@@ -1853,14 +1972,14 @@ def generate_triplet_pool(n_triplets: int, seed: int, log_every: int = 5000):
         neg_idx = [j for j in attrs if a_np[j]]
 
         # Find a valid target satisfying the query within the Hamming budget (resample if none)
-        candidates = find_valid_targets(train_labels_bool[s], pos_idx, neg_idx)
+        candidates = find_valid_targets(train_labels_bool, train_labels_bool[s], pos_idx, neg_idx)
         candidates = candidates[candidates != s]
         if candidates.numel() == 0:
             continue
         t = int(candidates[int(rng.integers(0, candidates.numel()))])
 
         # Mine one constraint-violating hard negative for this query (-1 if none exists)
-        h = find_hard_negative(train_labels_bool[s], pos_idx, neg_idx, s, rng)
+        h = find_hard_negative(train_labels_bool, train_labels_bool[s], pos_idx, neg_idx, s, rng)
 
         # Pad the condition to fixed width and record the triplet row
         attrs_row, signs_row = build_condition_row(pos_idx, neg_idx, MAX_TERMS)
@@ -1882,7 +2001,7 @@ def generate_triplet_pool(n_triplets: int, seed: int, log_every: int = 5000):
 # Cell  93 [code] - def load_or_generate_triplets(n_triplets: int, seed: int, cache_path: str)
 #==============================================================================
 
-def load_or_generate_triplets(n_triplets: int, seed: int, cache_path: str):
+def load_or_generate_triplets(n_triplets: int, seed: int, cache_path: str | Path):
     """Load a cached triplet pool if its generation key matches, else generate and cache it.
 
     The pool is fully determined by (seed, n_triplets, MAX_TERMS, HAMMING_BUDGET) and the train
@@ -1900,14 +2019,15 @@ def load_or_generate_triplets(n_triplets: int, seed: int, cache_path: str):
     """
     key = {"seed": seed, "n_triplets": n_triplets,
            "MAX_TERMS": MAX_TERMS, "HAMMING_BUDGET": HAMMING_BUDGET}
-    if os.path.exists(cache_path):
+    cache_path = Path(cache_path)
+    if cache_path.exists():
         blob = torch.load(cache_path, map_location="cpu")
         if blob.get("key") == key:
             print(f"Loaded {n_triplets} cached triplets (seed={seed}) from {cache_path}.")
             return tuple(blob["tensors"])
         print(f"Triplet cache {cache_path} key {blob.get('key')} != {key}; regenerating.")
     pool = generate_triplet_pool(n_triplets, seed)
-    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save({"key": key, "tensors": [t.cpu() for t in pool]}, cache_path)
     print(f"Saved {n_triplets} triplets (seed={seed}) to {cache_path}.")
     return pool
@@ -1915,8 +2035,8 @@ def load_or_generate_triplets(n_triplets: int, seed: int, cache_path: str):
 
 # --- Materialise the train/val triplet pools here, in the synthesis cell (cached and keyed on the
 #     generation parameters). The training cell below just consumes these tensors. ---
-CA_TRIPLETS_TRAIN_PATH = str(Path(EVALUATION_CACHE_DIR) / "cross_attn_triplets_train.pt")
-CA_TRIPLETS_VAL_PATH   = str(Path(EVALUATION_CACHE_DIR) / "cross_attn_triplets_val.pt")
+CA_TRIPLETS_TRAIN_PATH = EVALUATION_CACHE_DIR / "cross_attn_triplets_train.pt"
+CA_TRIPLETS_VAL_PATH   = EVALUATION_CACHE_DIR / "cross_attn_triplets_val.pt"
 ca_trip_src, ca_trip_tgt, ca_trip_attr, ca_trip_sign, ca_trip_hard = load_or_generate_triplets(
     CA_TRAIN_TRIPLETS, 10, CA_TRIPLETS_TRAIN_PATH)
 ca_val_src,  ca_val_tgt,  ca_val_attr,  ca_val_sign,  ca_val_hard  = load_or_generate_triplets(
@@ -1926,27 +2046,11 @@ print(f"hard negatives found for {(ca_trip_hard >= 0).float().mean().item():.1%}
 
 
 # --- Patch tokens for the unique train sources the triplets reference. Extracting only these
-#     (rather than the whole train split) bounds storage; a lookup maps an original train index to
-#     its row in the bank so the train/val loops can gather visual tokens per batch. ---
-CA_TRAIN_PATCHES_PATH = str(Path(EVALUATION_CACHE_DIR) / "patches_train.pt")
+#     (rather than the whole train split) bounds storage (see build_patch_bank). ---
+CA_TRAIN_PATCHES_PATH = EVALUATION_CACHE_DIR / "patches_train.pt"
 ca_patch_src = torch.unique(torch.cat([ca_trip_src, ca_val_src])).tolist()
-train_patches = get_encoded_patches(celeba_train, device, CA_TRAIN_PATCHES_PATH, indices=ca_patch_src)
-train_patch_lookup = torch.full((TRAIN_N,), -1, dtype=torch.long)
-train_patch_lookup[torch.tensor(ca_patch_src)] = torch.arange(len(ca_patch_src))
-print(f"train patch bank: {tuple(train_patches.shape)} over {len(ca_patch_src)} unique sources")
-
-
-def train_patches_for(idx: torch.Tensor) -> torch.Tensor:
-    """Gather cached CLIP visual tokens for train-split source indices via the bank lookup.
-
-    Args:
-        idx: (B,) original train-split source indices (any device).
-
-    Returns:
-        A (B, 50, 768) fp16 tensor on `idx`'s device, row-aligned to `idx`.
-    """
-    rows = train_patch_lookup[idx.cpu()]
-    return train_patches[rows].to(idx.device)
+train_patches_for = build_patch_bank(celeba_train, device, CA_TRAIN_PATCHES_PATH, ca_patch_src, TRAIN_N)
+print(f"train patch bank: {len(ca_patch_src)} unique sources")
 
 
 #==============================================================================
@@ -1965,24 +2069,27 @@ ca_val_src_dev, ca_val_attr_dev, ca_val_sign_dev = ca_val_src.to(device), ca_val
 ca_val_tgt_dev, ca_val_hard_dev = ca_val_tgt.to(device), ca_val_hard.to(device)
 
 
-def ca_infonce_loss(q: torch.Tensor, tgt_idx: torch.Tensor, hard_idx: torch.Tensor) -> torch.Tensor:
+def ca_infonce_loss(q: torch.Tensor, tgt_idx: torch.Tensor, hard_idx: torch.Tensor,
+                    embeddings: torch.Tensor, logit_scale: torch.Tensor) -> torch.Tensor:
     """Compute the InfoNCE loss over in-batch targets plus one mined hard negative per row.
 
     Args:
         q: (B, D) fused query embeddings.
-        tgt_idx: (B,) gallery indices of the positive target per row.
+        tgt_idx: (B,) indices of the positive target per row, into `embeddings`.
         hard_idx: (B,) mined hard-negative indices per row; negative marks "none".
+        embeddings: (N, D) L2-normalized embedding bank the indices refer to.
+        logit_scale: Scalar temperature multiplier (frozen CLIP logit scale).
 
     Returns:
         The scalar InfoNCE loss.
     """
-    t = train_embeddings[tgt_idx]
+    t = embeddings[tgt_idx]
     no_hard = hard_idx < 0
-    hf = train_embeddings[hard_idx.clamp(min=0)]            # (B, D); invalid rows masked below
+    hf = embeddings[hard_idx.clamp(min=0)]                # (B, D); invalid rows masked below
     hard_sim = (q * hf).sum(-1, keepdim=True)             # (B, 1) per-row hard-negative score
-    logits = logit_scale_value * torch.cat([q @ t.T, hard_sim], dim=1)   # (B, B+1)
+    logits = logit_scale * torch.cat([q @ t.T, hard_sim], dim=1)   # (B, B+1)
     logits[:, -1] = logits[:, -1].masked_fill(no_hard, -1e9)
-    labels_ce = torch.arange(q.shape[0], device=device)
+    labels_ce = torch.arange(q.shape[0], device=q.device)
     return F.cross_entropy(logits, labels_ce)
 
 
@@ -2003,7 +2110,8 @@ def ca_val_loss() -> float:
     for start in range(0, n_val, CA_BATCH):
         sl = slice(start, min(start + CA_BATCH, n_val))
         q = ca_model(train_embeddings[ca_val_src_dev[sl]], train_patches_for(ca_val_src_dev[sl]), ca_val_attr_dev[sl], ca_val_sign_dev[sl])
-        loss_sum += float(ca_infonce_loss(q, ca_val_tgt_dev[sl], ca_val_hard_dev[sl])) * q.shape[0]
+        loss_sum += float(ca_infonce_loss(q, ca_val_tgt_dev[sl], ca_val_hard_dev[sl],
+                                          train_embeddings, logit_scale_value)) * q.shape[0]
     return loss_sum / n_val
 
 
@@ -2046,7 +2154,7 @@ def plot_training_curve(history: dict, title: str = "Cross-Attention Training Cu
 # Cell  99 [code] - Train (or load cached) Cross-Attention model
 #==============================================================================
 
-CA_CKPT = Path(EVALUATION_CACHE_DIR) / "cross_attn_patch.pt"
+CA_CKPT = EVALUATION_CACHE_DIR / "cross_attn_patch.pt"
 _ca_cached = torch.load(CA_CKPT, map_location=device) if CA_CKPT.exists() else None
 
 if _ca_cached is not None:
@@ -2092,7 +2200,8 @@ else:
         for start in range(0, n_train_trip, CA_BATCH):
             idx = perm[start:start + CA_BATCH]
             q = ca_model(train_embeddings[ca_trip_src_dev[idx]], train_patches_for(ca_trip_src_dev[idx]), ca_trip_attr_dev[idx], ca_trip_sign_dev[idx])
-            loss = ca_infonce_loss(q, ca_trip_tgt_dev[idx], ca_trip_hard_dev[idx])
+            loss = ca_infonce_loss(q, ca_trip_tgt_dev[idx], ca_trip_hard_dev[idx],
+                                   train_embeddings, logit_scale_value)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
@@ -2133,28 +2242,12 @@ else:
 # Gallery visual tokens (CLS + 49 patches) for the source side of retrieval. The gallery *target*
 # side stays the pooled, frozen ``gallery_embeddings``, so retrieval cost is unchanged; only the
 # query computation reads patches. Only the benchmark's *source* images are ever queried this way
-# (scorer/inspection both index by source_idx), so - mirroring the train-split pattern above
-# (``train_patch_lookup`` / ``train_patches_for``) - we encode just that subset rather than all
-# 19,962 test images, with an index lookup mapping an original gallery index to its row in the bank.
-# Kept on CPU (fp16); the lookup moves one source's slice to GPU.
-GALLERY_PATCHES_PATH = str(Path(EVALUATION_CACHE_DIR) / "patches_test.pt")
+# (scorer/inspection both index by source_idx), so - mirroring the train-split bank above - we
+# encode just that subset rather than all 19,962 test images (see build_patch_bank).
+GALLERY_PATCHES_PATH = EVALUATION_CACHE_DIR / "patches_test.pt"
 gallery_patch_src = sorted({src for ann in annotations for src in get_source_image_idxs(ann)})
-gallery_patches = get_encoded_patches(celeba, device, GALLERY_PATCHES_PATH, indices=gallery_patch_src)
-gallery_patch_lookup = torch.full((gallery_embeddings.shape[0],), -1, dtype=torch.long)
-gallery_patch_lookup[torch.tensor(gallery_patch_src)] = torch.arange(len(gallery_patch_src))
-
-
-def gallery_patches_for(idx: torch.Tensor) -> torch.Tensor:
-    """Gather cached CLIP visual tokens for gallery source indices via the bank lookup.
-
-    Args:
-        idx: (B,) original gallery indices (any device); must be benchmark source images.
-
-    Returns:
-        A (B, 50, 768) fp16 tensor on `idx`'s device, row-aligned to `idx`.
-    """
-    rows = gallery_patch_lookup[idx.cpu()]
-    return gallery_patches[rows].to(idx.device)
+gallery_patches_for = build_patch_bank(celeba, device, GALLERY_PATCHES_PATH,
+                                       gallery_patch_src, gallery_embeddings.shape[0])
 
 
 def query_to_condition_rows(text_query: str) -> tuple[torch.Tensor, torch.Tensor]:
@@ -2344,7 +2437,7 @@ def find_success_failure_sources(annotation: dict, k: int = 5) -> tuple[int | No
     success = failure = None
     for src in get_source_image_idxs(annotation):
         retrieved = retrieve_topk(scorer(src), exclude_idx=src, k=k)
-        hit = len(set(retrieved) & set(get_ground_truth_indices(annotation, src))) > 0
+        hit = len(set(retrieved) & set(get_target_indices(annotation, src))) > 0
         if hit and success is None:
             success = src
         if not hit and failure is None:
@@ -2392,7 +2485,7 @@ for kind, ann in inspection_queries:
         plot_cross_attention_inspection(
             src, query, k=INSPECT_K,
             label=f"{case} ({kind})",
-            ground_truth=set(get_ground_truth_indices(ann, src)),
+            ground_truth=set(get_target_indices(ann, src)),
         )
 
 
@@ -2416,3 +2509,70 @@ plot_results_table(
     all_methods_results,
     title="Final Method Comparison — mean Recall@K / Precision@K",
 )
+
+
+#==============================================================================
+# Cell 110 [code] - Paired significance tests (McNemar on per-source Recall@10)
+#==============================================================================
+
+from scipy.stats import binomtest
+
+
+def recall10_hits(evaluation_results: list[dict]) -> np.ndarray:
+    """Flatten a method's per-(query, source) Recall@10 outcomes into one aligned 0/1 vector.
+
+    evaluate() iterates annotations and sources in a fixed order, so vectors extracted this
+    way are paired across methods: position i is the same (query, source) for every method.
+
+    Args:
+        evaluation_results: Raw per-source metrics, as returned by evaluate().
+
+    Returns:
+        A 1D 0/1 int array, one entry per (query, source) pair.
+    """
+    return np.array([
+        metrics["Recall@10"]
+        for query_results in evaluation_results
+        for metrics in query_results.values()
+    ], dtype=int)
+
+
+def mcnemar_pvalue(hits_a: np.ndarray, hits_b: np.ndarray) -> tuple[float, int, int]:
+    """Exact McNemar test on paired binary outcomes.
+
+    Only discordant pairs carry information: b counts sources where A hits and B misses,
+    c the reverse. Under H0 (no difference) each discordant pair is a fair coin, so the
+    p-value is an exact two-sided binomial test.
+
+    Args:
+        hits_a: 0/1 outcome vector of method A.
+        hits_b: 0/1 outcome vector of method B, paired with `hits_a`.
+
+    Returns:
+        A (p_value, b, c) tuple; p_value is 1.0 when there are no discordant pairs.
+    """
+    b = int(((hits_a == 1) & (hits_b == 0)).sum())
+    c = int(((hits_a == 0) & (hits_b == 1)).sum())
+    p = 1.0 if b + c == 0 else binomtest(min(b, c), b + c, 0.5).pvalue
+    return p, b, c
+
+
+method_hits = {
+    "Baseline":                  recall10_hits(evaluation_results_baseline),
+    "Source-Attribute Matching": recall10_hits(evaluation_results_sam),
+    "Prompt Ensembling":         recall10_hits(evaluation_results_promptens),
+    "Cross-Attention":           recall10_hits(evaluation_results_ca),
+}
+
+# Consecutive narrative pairs, plus the overall baseline-to-best comparison
+method_pairs = list(zip(list(method_hits), list(method_hits)[1:]))
+method_pairs.append(("Baseline", "Cross-Attention"))
+
+n_pairs = len(next(iter(method_hits.values())))
+print(f"McNemar test on paired per-source Recall@10 hits ({n_pairs} (query, source) pairs)\n")
+print(f"{'Method A':<28} {'Method B':<28} {'R@10 A':>7} {'R@10 B':>7} {'A>B':>5} {'B>A':>5} {'p-value':>9}")
+for name_a, name_b in method_pairs:
+    hits_a, hits_b = method_hits[name_a], method_hits[name_b]
+    p, b, c = mcnemar_pvalue(hits_a, hits_b)
+    print(f"{name_a:<28} {name_b:<28} {hits_a.mean():>7.3f} {hits_b.mean():>7.3f} "
+          f"{b:>5} {c:>5} {p:>9.2g}")

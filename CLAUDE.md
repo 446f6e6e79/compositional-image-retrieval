@@ -32,7 +32,7 @@ make_scorer(annotation) -> scorer(source_idx) -> (N,) gallery scores
 
 **Attribute alignment:** CelebA has 40 label columns, but torchvision's `attr_names` has 41 entries (one empty string). Always use `get_attributes` (drops the empty) to keep names aligned with label columns and with learned per-attribute embedding rows.
 
-**Benchmark JSON shape:** each annotation has `query` (e.g. `"+glasses, -smile"`) and `ground_truth`, a dict mapping `source_image_idx` (string keys) to a list of valid target indices. Access via `get_text_query` / `get_source_image_idxs` / `get_ground_truth_indices`. A target is ground truth iff it strictly satisfies the query's +/- constraints AND is within Hamming distance 2 of the source's 40-bit attribute vector.
+**Benchmark JSON shape:** each annotation has `query` (e.g. `"+glasses, -smile"`) and `ground_truth`, a dict mapping `source_image_idx` (string keys) to a list of valid target indices. Access via `get_text_query` / `get_source_image_idxs` / `get_target_indices`. A target is ground truth iff it strictly satisfies the query's +/- constraints AND is within Hamming distance 2 of the source's 40-bit attribute vector.
 
 ### Methods, in narrative order
 
