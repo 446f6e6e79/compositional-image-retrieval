@@ -297,9 +297,9 @@ def get_encoded_patches(
 # Cell  11 [code] - Shared attribute/query helpers (names, index maps, signed-query parser)
 #==============================================================================
 
-_attribute_names_cache: list[str] | None = None
+_attribute_cache: list[str] | None = None
 
-def get_attribute_names(dataset=None) -> list[str]:
+def get_attributes(dataset=None) -> list[str]:
     """Return the dataset's attribute names, filtering out any empty strings.
 
     Memoized after the first call: CelebA's `attr_names` has 41 entries (one empty
@@ -313,12 +313,12 @@ def get_attribute_names(dataset=None) -> list[str]:
     Returns:
         The 40 non-empty attribute names, aligned with the label columns.
     """
-    global _attribute_names_cache
-    if _attribute_names_cache is None:
+    global _attribute_cache
+    if _attribute_cache is None:
         if dataset is None:
             dataset = celeba
-        _attribute_names_cache = [name for name in dataset.attr_names if name]
-    return _attribute_names_cache
+        _attribute_cache = [name for name in dataset.attr_names if name]
+    return _attribute_cache
 
 
 _attribute_index_cache: dict[str, int] | None = None
@@ -334,7 +334,7 @@ def attribute_to_index(name: str) -> int:
     """
     global _attribute_index_cache
     if _attribute_index_cache is None:
-        _attribute_index_cache = {n: i for i, n in enumerate(get_attribute_names())}
+        _attribute_index_cache = {n: i for i, n in enumerate(get_attributes())}
     return _attribute_index_cache[name]
 
 
@@ -347,7 +347,7 @@ def index_to_attribute(index: int) -> str:
     Returns:
         The attribute name at that position.
     """
-    return get_attribute_names()[index]
+    return get_attributes()[index]
 
 
 def query_to_signed_indices(text_query: str) -> tuple[list[int], list[int]]:
@@ -372,12 +372,12 @@ def query_to_signed_indices(text_query: str) -> tuple[list[int], list[int]]:
     return pos_idx, neg_idx
 
 
-_attribute_text_embs_cache: torch.Tensor | None = None
+_attribute_name_embs_cache: torch.Tensor | None = None
 
-def get_attribute_text_embeddings(device) -> torch.Tensor:
-    """Lazily encode and cache the bare-name CLIP text bank for the 40 attributes.
+def get_attribute_name_embeddings(device) -> torch.Tensor:
+    """Lazily encode and cache the cleaned attribute-name CLIP text bank for the 40 attributes.
 
-    Every attribute name becomes a bare lowercase phrase (e.g. "Wearing_Hat" -> "wearing
+    Every attribute name becomes a cleaned lowercase name (e.g. "Wearing_Hat" -> "wearing
     hat"); training-free and training-based methods alike reuse this same bank, so it's
     encoded once and cached rather than re-run per call site.
 
@@ -385,13 +385,13 @@ def get_attribute_text_embeddings(device) -> torch.Tensor:
         device: Device to place the cached embeddings on.
 
     Returns:
-        A (40, D) L2-normalized CLIP text embedding, one row per `get_attribute_names()` entry.
+        A (40, D) L2-normalized CLIP text embedding, one row per `get_attributes()` entry.
     """
-    global _attribute_text_embs_cache
-    if _attribute_text_embs_cache is None:
-        bare_attribute_prompts = [name.replace("_", " ").lower() for name in get_attribute_names()]
-        _attribute_text_embs_cache = encode_texts(bare_attribute_prompts, device)
-    return _attribute_text_embs_cache
+    global _attribute_name_embs_cache
+    if _attribute_name_embs_cache is None:
+        cleaned_attribute_names = [name.replace("_", " ").lower() for name in get_attributes()]
+        _attribute_name_embs_cache = encode_texts(cleaned_attribute_names, device)
+    return _attribute_name_embs_cache
 
 
 #==============================================================================
@@ -661,14 +661,14 @@ attr_freq = all_labels.mean(axis=0)
 print(f"{'Attribute':<20} {'Count':>10} {'Frequency':>10}")
 print("-" * 45)
 
-for attr, count, freq in zip(get_attribute_names(celeba), attr_counts, attr_freq):
+for attr, count, freq in zip(get_attributes(celeba), attr_counts, attr_freq):
     print(f"{attr:<20} {count:>10} {freq:>10.3f}")
 
 #==============================================================================
 # Cell  22 [code] - Attribute name/index maps & retrieve_by_attributes
 #==============================================================================
 
-attr_names = get_attribute_names(celeba)
+attr_names = get_attributes(celeba)
 
 def retrieve_by_attributes(query:dict):
     """Retrieve all dataset images that satisfy the given attribute conditions.
@@ -829,7 +829,7 @@ rng = np.random.default_rng(seed=0)
 selected_idxs = _select_pure_image_idxs(all_labels, rng)
 selected_img_embs = gallery_embeddings[selected_idxs].to(device)
 
-cos_mat = (get_attribute_text_embeddings(device) @ selected_img_embs.T).detach().cpu().numpy()
+cos_mat = (get_attribute_name_embeddings(device) @ selected_img_embs.T).detach().cpu().numpy()
 _print_cosine_diagnostics(cos_mat)
 
 
@@ -924,7 +924,6 @@ print("List of ground truth indices for the first annotation:", annotations[0].g
 
 #==============================================================================
 # Cell  42 [code] - Helper functions to extract query and ground-truth info from benchmark annotations
-# TODO: go on from here!
 #==============================================================================
 def get_text_query(annotation: dict) -> str:
     """Extract the text query from a benchmark annotation.
@@ -1109,11 +1108,8 @@ def evaluate_and_average(annotations: list[dict], make_scorer: Callable, verbose
 
 def baseline_scorer(gallery_embeddings: torch.Tensor) -> Callable:
     """Build the scorer factory for the signed-arithmetic baseline.
-
     Decomposes the query into signed attribute terms and fuses them with the source
     image embedding by simple latent arithmetic.
-    Attribute text embeddings come from the bare-name CLIP bank (get_attribute_text_embeddings);
-    the per-query delta is built once per annotation and reused for every source image.
 
     Args:
         gallery_embeddings: (N, D) gallery image embeddings, L2-normalized per row.
@@ -1123,14 +1119,14 @@ def baseline_scorer(gallery_embeddings: torch.Tensor) -> Callable:
     """
     def make_scorer(annotation: dict) -> Callable:
         """Build a per-query scorer from the query's signed attribute delta."""
-        attr_text_embs = get_attribute_text_embeddings(gallery_embeddings.device)
+        attr_name_embs = get_attribute_name_embeddings(gallery_embeddings.device)
         pos_idx, neg_idx = query_to_signed_indices(get_text_query(annotation))
         # Initialize delta vector to zero, then add/subtract attribute embeddings based on the query
         delta = torch.zeros(gallery_embeddings.shape[1], device=gallery_embeddings.device)
         if pos_idx:
-            delta = delta + attr_text_embs[pos_idx].sum(dim=0)
+            delta = delta + attr_name_embs[pos_idx].sum(dim=0)
         if neg_idx:
-            delta = delta - attr_text_embs[neg_idx].sum(dim=0)
+            delta = delta - attr_name_embs[neg_idx].sum(dim=0)
 
         def scorer(source_idx: int) -> torch.Tensor:
             """Score every gallery image against the fused source query embedding."""
@@ -1266,7 +1262,7 @@ for w_p in GRID_W_ATTR:
     for w_v in GRID_W_VISUAL:
         res = evaluate(
             annotations,
-            attribute_matching_scorer(gallery_embeddings, get_attribute_text_embeddings(device), w_query=1.0, w_attr=w_p, w_visual=w_v),
+            attribute_matching_scorer(gallery_embeddings, get_attribute_name_embeddings(device), w_query=1.0, w_attr=w_p, w_visual=w_v),
             verbose=False,
         )
         r10 = mean_recall_at_10(res)
@@ -1284,7 +1280,7 @@ SAM_WEIGHTS = dict(w_query=1.0, w_attr=best_w_attr, w_visual=best_w_visual)
 
 evaluation_results_sam, average_results_per_query_sam = evaluate_and_average(
     annotations,
-    attribute_matching_scorer(gallery_embeddings, get_attribute_text_embeddings(device), **SAM_WEIGHTS),
+    attribute_matching_scorer(gallery_embeddings, get_attribute_name_embeddings(device), **SAM_WEIGHTS),
 )
 print(f"Source-Attribute Matching: mean Recall@10 = {mean_recall_at_10(evaluation_results_sam):.4f}")
 
@@ -1295,14 +1291,11 @@ plot_metrics_across_k(
 
 
 #==============================================================================
-# Cell  69 [code] - Attribute phrase bank (positive/negative)
+# Cell  69 [code] - Attribute description bank (positive/negative)
 #==============================================================================
 
-# Person-referring positive AND negative phrases for each CelebA attribute.
-# The previous version only stored positives and negated their embedding by -1;
-# we now also store linguistic negatives so the negative side of the score is
-# computed against an actual "without ..." description.
-humanized_mappings_pos = {
+# Person-referring positive AND negative descriptions for each CelebA attribute.
+attribute_descriptions_pos = {
     "5_o_Clock_Shadow":     ["a person with a 5 o'clock shadow", "a person with light facial stubble", "a person with short beard stubble", "a face with a 5 o'clock shadow", "a man with a 5 o'clock shadow", "a person with visible beard stubble"],
     "Arched_Eyebrows":      ["a person with arched eyebrows", "a person with curved eyebrows", "a face with high arched eyebrows", "a portrait with strongly arched eyebrows", "a person whose eyebrows are clearly arched"],
     "Attractive":           ["an attractive person", "a good-looking person", "a visually appealing person", "a beautiful person", "an attractive face", "a strikingly attractive person"],
@@ -1349,7 +1342,7 @@ humanized_mappings_pos = {
 # CLIP's text encoder attends to the object token regardless of the "not" — phrasing
 # matters. Where a clean linguistic opposite exists (e.g. clean-shaven vs bearded)
 # we use it; otherwise we lean on "without {attr}" / "no {attr}" framings.
-humanized_mappings_neg = {
+attribute_descriptions_neg = {
     "5_o_Clock_Shadow":     ["a clean-shaven person", "a person with no facial stubble", "a person without a 5 o'clock shadow", "a smoothly shaven face"],
     "Arched_Eyebrows":      ["a person with flat eyebrows", "a person whose eyebrows are not arched", "a face with straight eyebrows"],
     "Attractive":           ["an unattractive person", "a plain-looking person", "an ordinary-looking person"],
@@ -1397,85 +1390,90 @@ humanized_mappings_neg = {
 # Cell  71 [code] - CLIP ImageNet-style prompt templates
 #==============================================================================
 
-# CLIP's official ImageNet templates, article-stripped for {phrase} noun phrases
-# (see the note above); the article-collapse leaves 55 unique templates.
+# CLIP's official ImageNet templates, article-stripped for the {description} slot
 clip_imagenet_templates = [
-    "a bad photo of {phrase}.", "a photo of many {phrase}.", "a sculpture of {phrase}.",
-    "a photo of the hard to see {phrase}.", "a low resolution photo of {phrase}.", "a rendering of {phrase}.",
-    "graffiti of {phrase}.", "a cropped photo of {phrase}.", "a tattoo of {phrase}.",
-    "the embroidered {phrase}.", "a photo of a hard to see {phrase}.", "a bright photo of {phrase}.",
-    "a photo of a clean {phrase}.", "a photo of a dirty {phrase}.", "a dark photo of {phrase}.",
-    "a drawing of {phrase}.", "a photo of my {phrase}.", "the plastic {phrase}.",
-    "a photo of the cool {phrase}.", "a close-up photo of {phrase}.", "a black and white photo of {phrase}.",
-    "a painting of {phrase}.", "a pixelated photo of {phrase}.", "a plastic {phrase}.",
-    "a photo of the dirty {phrase}.", "a jpeg corrupted photo of {phrase}.", "a blurry photo of {phrase}.",
-    "a photo of {phrase}.", "a good photo of {phrase}.", "a {phrase} in a video game.",
-    "a photo of one {phrase}.", "a doodle of {phrase}.", "the origami {phrase}.",
-    "a sketch of {phrase}.", "a origami {phrase}.", "the toy {phrase}.",
-    "a rendition of {phrase}.", "a photo of the clean {phrase}.", "a photo of a large {phrase}.",
-    "a photo of a nice {phrase}.", "a photo of a weird {phrase}.", "a cartoon {phrase}.",
-    "art of {phrase}.", "a embroidered {phrase}.", "itap of {phrase}.",
-    "a plushie {phrase}.", "a photo of the nice {phrase}.", "a photo of the small {phrase}.",
-    "a photo of the weird {phrase}.", "the cartoon {phrase}.", "a photo of the large {phrase}.",
-    "the plushie {phrase}.", "a toy {phrase}.", "a photo of a cool {phrase}.",
-    "a photo of a small {phrase}.",
+    "a bad photo of {description}.", "a photo of many {description}.", "a sculpture of {description}.",
+    "a photo of the hard to see {description}.", "a low resolution photo of {description}.", "a rendering of {description}.",
+    "graffiti of {description}.", "a cropped photo of {description}.", "a tattoo of {description}.",
+    "the embroidered {description}.", "a photo of a hard to see {description}.", "a bright photo of {description}.",
+    "a photo of a clean {description}.", "a photo of a dirty {description}.", "a dark photo of {description}.",
+    "a drawing of {description}.", "a photo of my {description}.", "the plastic {description}.",
+    "a photo of the cool {description}.", "a close-up photo of {description}.", "a black and white photo of {description}.",
+    "a painting of {description}.", "a pixelated photo of {description}.", "a plastic {description}.",
+    "a photo of the dirty {description}.", "a jpeg corrupted photo of {description}.", "a blurry photo of {description}.",
+    "a photo of {description}.", "a good photo of {description}.", "a {description} in a video game.",
+    "a photo of one {description}.", "a doodle of {description}.", "the origami {description}.",
+    "a sketch of {description}.", "a origami {description}.", "the toy {description}.",
+    "a rendition of {description}.", "a photo of the clean {description}.", "a photo of a large {description}.",
+    "a photo of a nice {description}.", "a photo of a weird {description}.", "a cartoon {description}.",
+    "art of {description}.", "a embroidered {description}.", "itap of {description}.",
+    "a plushie {description}.", "a photo of the nice {description}.", "a photo of the small {description}.",
+    "a photo of the weird {description}.", "the cartoon {description}.", "a photo of the large {description}.",
+    "the plushie {description}.", "a toy {description}.", "a photo of a cool {description}.",
+    "a photo of a small {description}.",
 ]
 portrait_templates = [
-    "a portrait of {phrase}.",
-    "a portrait photograph of {phrase}.",
-    "a closeup headshot of {phrase}.",
-    "a candid photo of {phrase}.",
-    "a studio portrait of {phrase}.",
-    "a high-resolution headshot of {phrase}.",
-    "a face photo of {phrase}.",
-    "a photo showing the face of {phrase}.",
-    "a frontal photo of {phrase}.",
-    "a clear photo of {phrase}.",
+    "a portrait of {description}.",
+    "a portrait photograph of {description}.",
+    "a closeup headshot of {description}.",
+    "a candid photo of {description}.",
+    "a studio portrait of {description}.",
+    "a high-resolution headshot of {description}.",
+    "a face photo of {description}.",
+    "a photo showing the face of {description}.",
+    "a frontal photo of {description}.",
+    "a clear photo of {description}.",
 ]
 prompt_templates = clip_imagenet_templates + portrait_templates
 
 
 @torch.no_grad()
-def _encode_phrases_through_templates(phrases: list[str], templates: list[str]) -> torch.Tensor:
-    """Encode every (phrase x template) pair, mean-pool the embeddings, and re-normalize.
+def _encode_descriptions_through_templates(descriptions: list[str], templates: list[str]) -> torch.Tensor:
+    """Encode every (description x template) pair, mean-pool the embeddings, and re-normalize.
 
     Each pair is L2-normalized before pooling; batched in a single processor/model
     call for speed.
 
     Args:
-        phrases: Phrases to expand across templates.
-        templates: Prompt templates with a `{phrase}` placeholder.
+        descriptions: Attribute descriptions to expand across templates.
+        templates: Prompt templates with a `{description}` placeholder.
 
     Returns:
         A single (D,) L2-normalized ensemble embedding.
     """
-    prompts = [template.format(phrase=phrase) for phrase in phrases for template in templates]
+    # Build the full prompt list as description x template
+    prompts = [template.format(description=description) for description in descriptions for template in templates]
+    # Encode all prompts in one batch
     embs = encode_texts(prompts, device)   # (P, D), per-row normalized
     mean_emb = embs.mean(dim=0)
     return mean_emb / mean_emb.norm()
 
 
 @torch.no_grad()
-def precompute_attribute_pos_neg_embeddings() -> tuple[torch.Tensor, torch.Tensor]:
+def precompute_attribute_description_embeddings() -> tuple[torch.Tensor, torch.Tensor]:
     """Build the per-attribute positive and negative text-embedding banks.
 
-    E_pos[i] = ensemble over (positive phrases for attribute i) x (templates)
-    E_neg[i] = ensemble over (negative phrases for attribute i) x (templates)
+    E_pos[i] = ensemble over (positive descriptions for attribute i) x (templates)
+    E_neg[i] = ensemble over (negative descriptions for attribute i) x (templates)
 
     Returns:
         An (E_pos, E_neg) pair, each (40, 512) and L2-normalized.
     """
     pos_embs, neg_embs = [], []
-    for name in attr_names:
-        pos_embs.append(_encode_phrases_through_templates(humanized_mappings_pos[name], prompt_templates))
-        neg_embs.append(_encode_phrases_through_templates(humanized_mappings_neg[name], prompt_templates))
+    for attribute_name in attr_names:
+        # Retrieve the positive and negative natural-language descriptions for this attribute
+        pos_descriptions = attribute_descriptions_pos[attribute_name]
+        neg_descriptions = attribute_descriptions_neg[attribute_name]
+        # Encode each description through the prompt templates, mean-pool, and L2-normalize
+        pos_embs.append(_encode_descriptions_through_templates(pos_descriptions, prompt_templates))
+        neg_embs.append(_encode_descriptions_through_templates(neg_descriptions, prompt_templates))
     E_pos = torch.stack(pos_embs, dim=0)
     E_neg = torch.stack(neg_embs, dim=0)
     return E_pos, E_neg
 
 
 print("Precomputing pos/neg attribute embeddings with the expanded template bank (this may take a minute)...")
-E_POS, E_NEG = precompute_attribute_pos_neg_embeddings()
+E_POS, E_NEG = precompute_attribute_description_embeddings()
 E_POS = E_POS.to(gallery_embeddings.device)
 E_NEG = E_NEG.to(gallery_embeddings.device)
 print(f"E_POS: {tuple(E_POS.shape)},  E_NEG: {tuple(E_NEG.shape)}")
@@ -1521,7 +1519,7 @@ CA_EPOCHS         = 20         # training epochs
 CA_BATCH          = 512        # mini-batch size
 CA_LR             = 2e-4       # AdamW learning rate
 CA_WD             = 1e-2       # AdamW weight decay
-CA_HARD_NEG       = True       # mine one constraint-violating hard negative per triplet
+
 MAX_TERMS         = 3          # max attribute conditions per synthetic query (benchmark-dictated)
 HAMMING_BUDGET    = 2          # max Hamming distance for a valid target (matches benchmark)
 
@@ -1534,33 +1532,28 @@ CA_GATE_BIAS_INIT = 2.0        # gated-residual gate-open bias; sigmoid(2.0)≈0
 #==============================================================================
 
 class CrossAttentionFusion(nn.Module):
-    """Cross-attention fusion: the source image queries a sequence of text-encoded,
-    sign-tagged conditions, and the attended result is fused back onto the image embedding.
+    """Cross-attention fusion: the source image queries its sign-tagged conditions and the
+    attended result is fused back onto the image embedding. See the "Training-Based Method:
+    Cross-Attention Fusion" section of the report for the full architecture rationale.
 
-    Conditions reuse the frozen bare-name CLIP text bank (one vector per attribute). A learned,
-    sign-conditioned FiLM modulation turns each into an additive (+) or subtractive (-) condition:
-    ``conds = (1 + gamma) * attr_text + beta``, where ``(gamma, beta)`` are produced per sign, so
-    ``+attr`` and ``-attr`` become genuinely distinct, per-dimension vectors. Before the image
-    weighs them, a *patch-grounding* stage lets the conditions read the source's frozen CLIP
-    visual tokens - the CLS token (CLIP's global summary of a ViT-B/32 image) plus its 49
-    spatial patches: the conditions self-attend (co-adapt to one another, tempering mutually exclusive or
-    contradictory edits before the image ever reads them) and cross-attend over those tokens, so a
-    localized edit can latch onto the relevant region of *this* source rather than a generic
-    attribute direction. The image (a single query token) then attends over the grounded
-    conditions through a stack of pre-norm Transformer-decoder layers (cross-attention + GELU FFN +
-    dropout). Finally a *gated residual head* fuses the attended vector back onto the reference:
-    ``out = v_ref + sigmoid(gate) * delta``, so identity is preserved by default and the network
-    only nudges it (the signed ``delta`` can subtract, which a softmax-averaged attention cannot).
+    Pipeline, per forward pass:
+      1. Sign-aware FiLM: ``conds = (1 + gamma) * attr_name + beta``, with ``(gamma, beta)``
+         produced per sign, so ``+attr`` and ``-attr`` become distinct per-dimension vectors.
+      2. Patch grounding: conditions self-attend, then cross-attend over the source's CLIP
+         visual tokens (CLS + 49 patches).
+      3. The image (a single query token) attends over the grounded conditions through a
+         stack of pre-norm Transformer-decoder layers.
+      4. Gated residual head: ``out = v_ref + sigmoid(gate) * delta``.
     """
 
-    def __init__(self, attr_text_embs: torch.Tensor, dim: int, n_heads: int = 4,
+    def __init__(self, attr_name_embs: torch.Tensor, dim: int, n_heads: int = 4,
                  n_layers: int = 2, ffn_mult: int = 2, dropout: float = 0.1,
                  film_sign_std: float = 0.02, gate_bias_init: float = 2.0,
                  clip_dim: int = 768, ground_layers: int = 1, ground_heads: int = 4):
         """Build the cross-attention fusion module.
 
         Args:
-            attr_text_embs: (n_attrs, D) frozen bare-name CLIP text bank.
+            attr_name_embs: (n_attrs, D) frozen cleaned attribute-name CLIP text bank.
             dim: Embedding dimension D.
             n_heads: Number of attention heads per decoder layer.
             n_layers: Number of Transformer-decoder layers.
@@ -1574,8 +1567,8 @@ class CrossAttentionFusion(nn.Module):
         """
         super().__init__()
 
-        # Freeze the bare-name CLIP text bank (one vector per attribute) for cross-attention
-        self.register_buffer("attr_text", attr_text_embs)  # (n_attrs, D) frozen CLIP text
+        # Freeze the cleaned attribute-name CLIP text bank (one vector per attribute) for cross-attention
+        self.register_buffer("attr_name", attr_name_embs)  # (n_attrs, D) frozen CLIP text
 
         # Sign embedding: each sign (+/-) gets a learned per-dimension vector (gamma, beta) for FiLM
         self.sign_embed = nn.Embedding(2, dim)             # 0: +   1: -
@@ -1629,7 +1622,7 @@ class CrossAttentionFusion(nn.Module):
         """
         pad_mask = cond_sign == 0             # (B, T) True = ignore
         sign_id  = (cond_sign < 0).long()     # 0 for +, 1 for - (padding -> 0, masked anyway)
-        attr     = self.attr_text[cond_attr]  # (B, T, D) frozen text
+        attr     = self.attr_name[cond_attr]  # (B, T, D) frozen text
 
         # 1. Sign-aware FiLM: each sign modulates the attribute's text vector per-dimension
         gamma, beta = self.film(self.sign_embed(sign_id)).chunk(2, dim=-1)  # (B, T, D) each
@@ -1656,7 +1649,7 @@ class CrossAttentionFusion(nn.Module):
 
 
 ca_model = CrossAttentionFusion(
-    get_attribute_text_embeddings(device), gallery_embeddings.shape[1],
+    get_attribute_name_embeddings(device), gallery_embeddings.shape[1],
     n_heads=CA_HEADS, n_layers=CA_LAYERS, ffn_mult=CA_FFN_MULT, dropout=CA_DROPOUT,
     film_sign_std=CA_FILM_SIGN_STD, gate_bias_init=CA_GATE_BIAS_INIT,
     clip_dim=CLIP_VIS_DIM, ground_layers=CA_GROUND_LAYERS, ground_heads=CA_GROUND_HEADS,
@@ -1973,7 +1966,7 @@ ca_val_tgt_dev, ca_val_hard_dev = ca_val_tgt.to(device), ca_val_hard.to(device)
 
 
 def ca_infonce_loss(q: torch.Tensor, tgt_idx: torch.Tensor, hard_idx: torch.Tensor) -> torch.Tensor:
-    """Compute the InfoNCE loss over in-batch targets, optionally with mined hard negatives.
+    """Compute the InfoNCE loss over in-batch targets plus one mined hard negative per row.
 
     Args:
         q: (B, D) fused query embeddings.
@@ -1984,14 +1977,11 @@ def ca_infonce_loss(q: torch.Tensor, tgt_idx: torch.Tensor, hard_idx: torch.Tens
         The scalar InfoNCE loss.
     """
     t = train_embeddings[tgt_idx]
-    if CA_HARD_NEG:
-        no_hard = hard_idx < 0
-        hf = train_embeddings[hard_idx.clamp(min=0)]            # (B, D); invalid rows masked below
-        hard_sim = (q * hf).sum(-1, keepdim=True)             # (B, 1) per-row hard-negative score
-        logits = logit_scale_value * torch.cat([q @ t.T, hard_sim], dim=1)   # (B, B+1)
-        logits[:, -1] = logits[:, -1].masked_fill(no_hard, -1e9)
-    else:
-        logits = logit_scale_value * (q @ t.T)                # In-batch negatives only
+    no_hard = hard_idx < 0
+    hf = train_embeddings[hard_idx.clamp(min=0)]            # (B, D); invalid rows masked below
+    hard_sim = (q * hf).sum(-1, keepdim=True)             # (B, 1) per-row hard-negative score
+    logits = logit_scale_value * torch.cat([q @ t.T, hard_sim], dim=1)   # (B, B+1)
+    logits[:, -1] = logits[:, -1].masked_fill(no_hard, -1e9)
     labels_ce = torch.arange(q.shape[0], device=device)
     return F.cross_entropy(logits, labels_ce)
 

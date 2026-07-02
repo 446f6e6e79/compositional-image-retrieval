@@ -30,7 +30,7 @@ make_scorer(annotation) -> scorer(source_idx) -> (N,) gallery scores
 
 **Embeddings are L2-normalized at extraction time**, so cosine similarity is a plain dot product everywhere downstream.
 
-**Attribute alignment:** CelebA has 40 label columns, but torchvision's `attr_names` has 41 entries (one empty string). Always use `get_attribute_names` (drops the empty) to keep names aligned with label columns and with learned per-attribute embedding rows.
+**Attribute alignment:** CelebA has 40 label columns, but torchvision's `attr_names` has 41 entries (one empty string). Always use `get_attributes` (drops the empty) to keep names aligned with label columns and with learned per-attribute embedding rows.
 
 **Benchmark JSON shape:** each annotation has `query` (e.g. `"+glasses, -smile"`) and `ground_truth`, a dict mapping `source_image_idx` (string keys) to a list of valid target indices. Access via `get_text_query` / `get_source_image_idxs` / `get_ground_truth_indices`. A target is ground truth iff it strictly satisfies the query's +/- constraints AND is within Hamming distance 2 of the source's 40-bit attribute vector.
 
@@ -51,7 +51,7 @@ This is a report, and the ablation story is part of it. When adding or moving a 
 
 - Keep **all training-free methods before all training-based methods**.
 - Each training-free step must read as a *single upgrade* over the one before it (fusion, then bank, etc.); do not reorder so a later method changes two things at once.
-- Keep cross-block dependencies one-directional: training-based cells may consume training-free outputs (e.g. `Z_ENS`, `E_POS`/`E_NEG`, `get_attribute_text_embeddings()`), never the reverse.
+- Keep cross-block dependencies one-directional: training-based cells may consume training-free outputs (e.g. `Z_ENS`, `E_POS`/`E_NEG`, `get_attribute_name_embeddings()`), never the reverse.
 - The author edits cells between sessions - **re-read a cell before patching it** rather than assuming its current contents.
 
 ## Conventions
