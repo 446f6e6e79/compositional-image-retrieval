@@ -270,8 +270,9 @@ def get_encoded_patches(
         `indices` (or to the dataset order when `indices` is None).
     """
     model, _ = get_CLIP_model()
-    hidden_size = model.config.hidden_size  # adjust if your CLIP config exposes this differently
-    num_patches = (model.config.image_size // model.config.patch_size) ** 2
+    vision_config = model.config.vision_config
+    hidden_size = vision_config.hidden_size
+    num_patches = (vision_config.image_size // vision_config.patch_size) ** 2
     seq_len = num_patches + 1  # +1 for the CLS token
 
     def encode_batch(model, inputs) -> torch.Tensor:
@@ -1294,6 +1295,8 @@ VAL_QUERY_COUNT   = 36   # 3x the benchmark's query count, for a more robust hyp
 VAL_MAX_SOURCES   = 50   # cap sources per query to bound grid-search cost
 VAL_MIN_TARGETS   = 5    # benchmark rule: a source needs >= 5 valid targets
 VAL_SOURCE_TRIES  = 2000 # sampled source candidates per query before giving up
+VAL_SEEDS         = [12, 34, 56]  # independent query draws averaged in the grid search below, so
+                                   # the chosen weights aren't just the ones that got lucky on one draw
 
 
 def build_validation_annotations(
@@ -1353,8 +1356,12 @@ def build_validation_annotations(
     return annotations_out
 
 
-val_annotations = build_validation_annotations(train_labels_bool, VAL_QUERY_COUNT, seed=12)
-print(f"Built {len(val_annotations)} validation queries:")
+val_annotation_sets = [
+    build_validation_annotations(train_labels_bool, VAL_QUERY_COUNT, seed=seed)
+    for seed in VAL_SEEDS
+]
+val_annotations = val_annotation_sets[0]  # kept around for the inspection printout below
+print(f"Built {len(VAL_SEEDS)} validation query sets of {VAL_QUERY_COUNT} queries each (seeds {VAL_SEEDS}):")
 for ann in val_annotations:
     print(f"  {get_text_query(ann):<45} sources: {len(ann['ground_truth'])}")
 
@@ -1460,17 +1467,22 @@ def attribute_matching_scorer(
 
 # The grid is scored on the synthetic train-split validation queries, never on the
 # benchmark: the selected weights are frozen here and only then reported on the benchmark.
+# Each cell is averaged over VAL_SEEDS independent query draws (same scorer, evaluated against
+# each draw) so the pick isn't just the weights that got lucky on a single sample of queries.
 grid_rows = []
 for w_p in GRID_W_ATTR:
     for w_v in GRID_W_VISUAL:
-        res = evaluate(
-            val_annotations,
-            attribute_matching_scorer(train_embeddings, get_attribute_name_embeddings(device), w_query=1.0, w_attr=w_p, w_visual=w_v),
-            verbose=False,
+        scorer_factory = attribute_matching_scorer(
+            train_embeddings, get_attribute_name_embeddings(device), w_query=1.0, w_attr=w_p, w_visual=w_v
         )
-        r10 = mean_recall_at_10(res)
+        r10_per_seed = [
+            mean_recall_at_10(evaluate(val_ann, scorer_factory, verbose=False))
+            for val_ann in val_annotation_sets
+        ]
+        r10 = float(np.mean(r10_per_seed))
         grid_rows.append((w_p, w_v, r10))
-        print(f"w_attr={w_p:<5} w_visual={w_v:<4} mean val Recall@10={r10:.4f}")
+        seeds_str = ", ".join(f"{x:.4f}" for x in r10_per_seed)
+        print(f"w_attr={w_p:<5} w_visual={w_v:<4} mean val Recall@10={r10:.4f}  (per-seed: {seeds_str})")
 
 best_w_attr, best_w_visual, best_r10 = max(grid_rows, key=lambda row: row[2])
 print(f"\nBest: w_attr={best_w_attr}, w_visual={best_w_visual} (mean val Recall@10={best_r10:.4f})")

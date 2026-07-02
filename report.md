@@ -190,7 +190,7 @@ The structural hyperparameters $(w_q, w_r, w_v)$ are static scalar weights optim
 
 The three weights `w_query`, `w_attr`, `w_visual` are training-free hyperparameters tuned with a
 deliberately small grid so sensitivity stays visible. They are tuned **once**, using the simple
-bare-name attribute bank (Source-Attribute Matching); Prompt Ensembling reuses the same `PM_WEIGHTS` with its
+bare-name attribute bank (Source-Attribute Matching); Prompt Ensembling reuses the same `SAM_WEIGHTS` with its
 improved bank, making the two methods directly comparable.
 
 ---
