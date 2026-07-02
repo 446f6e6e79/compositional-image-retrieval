@@ -253,41 +253,30 @@ At evaluation the scorer builds **one** composite query embedding per source ima
 
 ### Cross-Attention: Qualitative Inspection
 
-To see *what the trained model does* and where it breaks, we inspect a **SUCCESS** and a **FAILURE** case for two query types the benchmark stresses: a single-attribute **negation** (e.g. `-Heavy Makeup`) and a **composed** multi-attribute query (e.g. `+Eyeglasses, -Smiling`). For each, we automatically pick, from that query's own benchmark sources, one source the model gets right (a ground-truth target in its top-k) and one it gets wrong (none in top-k); nothing is hardcoded.
+To understand the model's behavior and edge cases, we analyze successful and failed retrievals across two key query types: **negation** (e.g., `-Heavy Makeup`) and **composed** multi-attribute edits (e.g., `+Eyeglasses, -Smiling`). Rather than hardcoding examples, we automatically select one source image where the model succeeds (the ground-truth target is in the top-k) and one where it fails (the target is missed).
 
-For each `(source, query)` we read out:
+For each evaluated pair, we extract two primary metrics:
 
-- **Top-k retrieval under the edit**: the images the *fused* query pulls to the top (source excluded), each marked ✓/✗ for satisfying the requested attributes and tagged `GT` when it is a benchmark target. This shows directly whether the edit moved retrieval toward the request rather than toward look-alikes of the source.
-- **Residual gate** $\sigma(g)\in[0,1]$ from the gated-residual head: its mean summarises overall edit strength, while a low mean with a few high dimensions signals a localised edit and a flat $\approx 0.5$ means the head barely moved off its initialisation.
+* **Top-K Retrieval:** This reveals whether the edit successfully shifted the search toward the requested traits rather than just returning visual duplicates of the source.
+* **Residual Gate Value ($\sigma(g)$):** The mean of this value summarizes the overall edit strength: a lower mean with a few sharp peaks indicates a precise, localized attribute change, while a flat value shows the model relied mostly on its initialization.
 
-The trained weights are reused exactly; nothing is re-trained.
+All analysis is performed directly using the frozen, trained weights without any additional training.
 
 ### Limitations
 
-Our proposed method is a step forward, but the following limitations remain:
+While our method shows clear progress, several architectural and semantic limitations remain:
 
-- **The attention does relatively light work.** A query carries at most $T=3$ conditions, so the cross-attention only arbitrates among a handful of vectors. Most of the lift comes from the sign-aware FiLM and the gated residual; the attention mainly reweights. The Transformer is the right *frame*, but not where the heavy lifting happens.
+* **Underutilized Attention Mechanism:** The cross-attention module handles very little complexity because a query rarely exceeds three target attributes. Instead of learning complex, non-linear relationships, the Transformer layer acts primarily as a basic reweighting tool. The actual architectural heavy lifting is done by the simpler FiLM and gated residual modules.
 
-- **The capacity ceiling is now the pooled gallery target, not the source.** The source enters as CLIP's full visual-token sequence, so edits can ground on the region they should touch, but each gallery image is still indexed as a single pooled 512-d embedding. A localised edit must therefore be matched against a holistic vector; lifting this would require a patch-level gallery index, at a real cost in storage and retrieval time.
+* **Asymmetric Gallery Capacity:** There is a severe mismatch in resolution between the input and the output. The source image is processed using CLIP’s full visual-token sequence, which allows the model to pinpoint exactly *where* to make an edit. However, the gallery images are indexed as single, pooled 512-dimensional vectors. Matching a highly localized, token-level edit against a holistic gallery vector inherently limits retrieval precision.
 
-- **The text bank is frozen and non-compositional.** Conditions are bare-name CLIP text vectors, and CLIP text behaves like a bag of concepts. Interacting attributes (e.g. *Smiling* and *Mouth Slightly Open*) enter as independent conditions that can only be reweighted, not jointly understood.
+* **Rigid, Non-Compositional Text Representations:** The text conditions rely on frozen CLIP embeddings, which treat text like a disjointed "bag of concepts." When attributes naturally interact or overlap the model cannot merge them into a single, unified concept. It can only scale their individual vectors independently.
 
-- **Negation still rides on the CLIP geometry.** Approximating "absence of an attribute" as a direction in an embedding space never trained for negation is a learned workaround, not a true representation of *not*.
+* **Conservative Editing Bias:** The architecture is designed to default to the reference image embedding to protect identity. Because preserving the original image is always the safest path for minimizing the contrastive loss, the model often chooses to under-edit strong requests rather than risk distorting the core identity of the subject.
 
-- **Identity is preserved at the cost of under-editing.** Because the output defaults to $\mathbf{v}_{\text{ref}}$, leaving the embedding nearly unchanged is always the safe option for the contrastive loss, so strongly requested edits can be damped.
+* **CoOp or Prompt Ensembling**
 
 ---
 
 ## References
 
-1. **CLIP** — A. Radford, J. W. Kim, C. Hallacy, et al. *Learning Transferable Visual Models From Natural Language Supervision.* ICML 2021. [arXiv:2103.00020](https://arxiv.org/abs/2103.00020)
-2. **Transformer** — A. Vaswani, N. Shazeer, N. Parmar, et al. *Attention Is All You Need.* NeurIPS 2017. [arXiv:1706.03762](https://arxiv.org/abs/1706.03762)
-3. **FiLM** — E. Perez, F. Strub, H. de Vries, V. Dumoulin, A. Courville. *FiLM: Visual Reasoning with a General Conditioning Layer.* AAAI 2018. [arXiv:1709.07871](https://arxiv.org/abs/1709.07871)
-4. **InfoNCE / CPC** — A. van den Oord, Y. Li, O. Vinyals. *Representation Learning with Contrastive Predictive Coding.* 2018. [arXiv:1807.03748](https://arxiv.org/abs/1807.03748)
-5. **CelebA** — Z. Liu, P. Luo, X. Wang, X. Tang. *Deep Learning Face Attributes in the Wild.* ICCV 2015. [arXiv:1411.7766](https://arxiv.org/abs/1411.7766)
-6. **TIRG** — N. Vo, L. Jiang, C. Sun, et al. *Composing Text and Image for Image Retrieval — An Empirical Odyssey.* CVPR 2019. [arXiv:1812.07119](https://arxiv.org/abs/1812.07119)
-7. **Combiner (CLIP4Cir)** — A. Baldrati, M. Bertini, T. Uricchio, A. Del Bimbo. *Effective Conditioned and Composed Image Retrieval Combining CLIP-Based Features.* CVPR 2022. [dblp](https://dblp.org/rec/conf/cvpr/BaldratiBUB22a.html)
-8. **Pic2Word** — K. Saito, K. Sohn, X. Zhang, et al. *Pic2Word: Mapping Pictures to Words for Zero-shot Composed Image Retrieval.* CVPR 2023. [arXiv:2302.03084](https://arxiv.org/abs/2302.03084)
-9. **CoOp** — K. Zhou, J. Yang, C. C. Loy, Z. Liu. *Learning to Prompt for Vision-Language Models.* IJCV 2022. [arXiv:2109.01134](https://arxiv.org/abs/2109.01134)
-10. **TopK-SAE** — L. Gao, T. Dupré la Tour, H. Tillman, et al. *Scaling and Evaluating Sparse Autoencoders.* 2024. [arXiv:2406.04093](https://arxiv.org/abs/2406.04093)
-11. **CLIP prompt templates** — OpenAI. *Prompt Engineering for ImageNet* (notebook). [GitHub](https://github.com/openai/CLIP/blob/main/notebooks/Prompt_Engineering_for_ImageNet.ipynb)
