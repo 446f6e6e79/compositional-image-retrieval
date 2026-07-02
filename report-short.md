@@ -178,27 +178,27 @@ Despite providing high-fidelity reconstructions, this approach failed to deliver
 
 ---
 
-## Training-Based Method: Cross-Attention Fusion
+## Cross-Attention Fusion (Training-based)
 
-Every method so far combines the visual reference and its textual conditions with a *fixed* rule (latent arithmetic, profile matching, or a learned prompt). 
+Every method so far combines the visual reference and its textual conditions with a fixed, query-agnostic rule. These hard-coded combinations suffer from three specific architectural limitations:
 
-**Cross-Attention Fusion** instead *learns* the combination: a small trained module reads the reference image together with its `±attribute` conditions and produces a single composite query that keeps the reference's identity while applying the requested edits. The reference image attends over its conditions and decides, per image, how strongly each one should count.
+* **Embedding-space negation:** Subtracting a text vector in CLIP space merely creates a geometric mirror point rather than a true semantic opposite.
+* **Ungrounded edit directions:** A generic attribute vector remains identical across all inputs, failing to adapt to the specific visual context of the reference image.
+* **Source leakage:** The reference embedding entangles every attribute of the person, including the one being edited, so a fixed combination is pulled toward look-alikes of the source and dilutes the requested change instead of separating what to keep from what to modify.
+
+**Cross-Attention Fusion** instead *learns* the combination with a small module $\Phi_\theta$ trained on top of frozen CLIP: the reference image attends over its signed conditions to weigh each edit *per image* rather than by a fixed rule.
 
 ### Architecture
 
-**The fixed-rule ceiling.** Latent arithmetic, attribute matching, and prompt ensembling all fuse the reference and its conditions with a rule that does not change from query to query: a static sum, or a set of weights ($w_q,w_r,w_v$) grid-tuned once and then frozen. None of them can look at *this* face and decide that, say, the eyeglasses edit should count for more than the smiling edit *for this person*. That is precisely the gap this project targets in CLAY's static, pre-SVD stacking of conditions (see Contributions). Cross-Attention Fusion replaces the fixed rule with a small trained module $\Phi_\theta$ that reads the reference together with its signed conditions and outputs one composite query - learning the weighting the earlier methods could only hard-code.
+To achieve this adaptive combination, the source image is first processed at two distinct granularity simultaneously. CLIP processes the input into a regular grid of non-overlapping **spatial patch tokens** $V_{\text{raw}}$, which act as localized descriptors of specific regions like an eye or the hairline, enabling targeted, position-aware editing. Alongside these localized patches, the encoder extracts a specialized **CLS token**, a single global vector $\mathbf{v}_{\text{ref}}$ that pools and summarizes the entire face. In parallel, each textual condition (without the sign) is encoded into its own attribute vector $\mathbf{t}_a$.
 
-Three more specific failures, each already diagnosed earlier in this report, motivate the module's remaining three pieces:
+The fusion process begins by passing each attribute vector $\mathbf{t}_a$ through **sign-aware FiLM conditioning** [(Perez et al., 2018)](https://arxiv.org/abs/1709.07871), a lightweight affine layer that rewrites each condition based on its positive or negative sign so that adding and removing a feature become distinct learned directions $\mathbf{c}_k$ rather than simple geometric mirror images.
 
-- **Embedding-space negation** (Baseline): subtracting a text vector $-\mathbf{t}_j$ is not the semantic opposite of adding it $\mathbf{t}_j$ in CLIP space, only its mirror point. **Sign-aware FiLM** replaces that sign flip with a learned, per-dimension transform, so `+attr` and `-attr` become genuinely distinct directions instead of mirror images.
-- **A generic, ungrounded edit direction**: a bare-name attribute vector is identical regardless of which face it is applied to, so "remove the glasses" carries no notion of *where* on this particular face the glasses are. **Patch grounding** lets every condition read the source's own visual tokens before the image weighs it.
-- **Convex-combination-only fusion**: any combiner that mixes image and text through a softmax - attention included - can only interpolate between its inputs, never point against one of them to truly remove a feature [(Baldrati et al., 2022)](https://dblp.org/rec/conf/cvpr/BaldratiBUB22a.html). The **gated-residual head** instead outputs a signed, additive correction onto the reference, so subtraction is possible and identity is the default rather than something the network must reconstruct.
+Next, these conditions $\mathbf{c}_k$ undergo **patch grounding**: acting as queries, they read the projected patch tokens $V$ through the cross-attention of a Transformer-decoder layer [(Vaswani et al., 2017)](https://arxiv.org/abs/1706.03762), while self-attention lets the conditions co-adapt with one another. This anchors each requested edit directly onto the specific region of the reference face it should physically alter.
 
-The rest of this section derives these four stages - **sign-aware FiLM**, **patch grounding**, **stacked cross-attention**, and the **gated residual** - in turn, each opening with the problem it solves before its formal definition.
+The core of the system relies on **stacked cross-attention**. The global image summary $\mathbf{v}_{\text{ref}}$ acts as the single query token, while the grounded, signed conditions $C$ serve as keys and values. In this setup, the image dynamically determines how strongly weight each requested edit based on its own identity. Stacking $L$ such decoder layers allows the image to iteratively read the conditions and update its representation, ultimately producing the attended vector $\mathbf{a}$.
 
-**How the Transformer maps to our problem.** The sequence the attention runs over is neither image patches nor text sub-words: it is the query's own short list of `±attribute` edits (one to three of them), so the sequence length is simply *how many things you asked to change*. The **source image is the single query token** ($Q$), while the **sign-modulated condition vectors are the keys and values** ($K=V$). Read semantically, the image asks *"given who I am, how strongly should I weigh each requested edit?"* - and because there is exactly one query token, the output is a content-based weighted average of the conditions, with the weights computed from the image itself, which is exactly the per-image weighting the fixed-rule methods cannot express.
-
-At a high level (diagram below), frozen CLIP encodes the source image into a unit-norm embedding $\mathbf{v}_{\text{ref}}$ **and** its sequence of visual tokens - CLIP's global **CLS** summary of the whole image together with its 49 spatial patch tokens - and each condition into the bare-name text vector $\mathbf{t}_a$ of its attribute; the trained module $\Phi_\theta$ fuses them into a single query $\mathbf{q}$, which ranks the frozen gallery by cosine similarity.
+Finally, **gated-residual fusion** [(Vo et al., 2019)](https://arxiv.org/abs/1812.07119) applies this attended vector $\mathbf{a}$ as a signed correction $\boldsymbol{\delta}$, gated per-dimension by $\mathbf{g}$, directly onto the global identity vector $\mathbf{v}_{\text{ref}}$. This mechanism preserves the source's original identity by default while allowing targeted features to be genuinely removed, ultimately producing a single unit-norm query $\mathbf{q}$ ready to rank the gallery by cosine similarity.
 
 ![High-level architecture of the cross-attention fusion module](figures/architecture.svg)
 
