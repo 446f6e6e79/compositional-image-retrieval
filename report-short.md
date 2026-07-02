@@ -227,36 +227,29 @@ Once trained, the gate localizes edits to specific coordinates while leaving the
 
 ### Training
 
-The fusion module is trained with synthetic, label-free supervision built from CelebA's attribute annotations, so no manual labelling is needed. At each step we take a reference image, flip a few of its attributes to form a signed query, and fetch from the training split a real image that matches the edited attribute profile to serve as the **positive target**; optionally we also mine a **hard negative** that looks right but violates one requested sign. A contrastive objective then pulls the fused query toward its target and pushes it away from the other images in the batch, including that hard negative. Only the fusion module is updated, while CLIP and the attribute text bank stay frozen. The diagram below traces one training triplet from the reference to the loss.
-
 ![Label-free triplet supervision and the InfoNCE objective](figures/training.svg)
 
-The diagram above shows one triplet; this section spells out how the triplets are synthesised and how the objective is optimised.
+**Triplet synthesis:** Each triplet originates from a random reference image $s$ with its corresponding binary attribute vector $\mathbf{b}_s$. A few attributes are randomly sampled and flipped to construct a signed edit query $q$. Applying these exact flips to the original vector yields the ideal target profile, $\mathbf{b}^\star$. The **positive target** $t$ is then drawn from real images that satisfy the query constraints while remaining within a strict Hamming distance budget of the ideal profile.
 
-**Triplet synthesis.** Each triplet starts from a random reference image $s$ with its 40-bit CelebA attribute vector $\mathbf{b}_s$. We sample 1 to 3 of its attributes and flip them into a signed query $q$ (a flipped-on attribute becomes a `+` term, a flipped-off attribute a `-` term), and build the ideal target attribute vector $\mathbf{b}^\star$ by copying $\mathbf{b}_s$ and applying exactly those flips. The **positive target** $t$ is drawn from the training split among real images that satisfy the query and lie within the benchmark's Hamming budget of the ideal profile, $\lVert \mathbf{b}_t - \mathbf{b}^\star \rVert_1 \le 2$. This is the same rule the benchmark uses to judge a correct retrieval, so the model is trained against the exact target definition it is later evaluated on. Since $\mathbf{b}_s$, the chosen flips, and the candidate labels are all that is required, the triplets $(s,q,t)$ are produced with no human annotation, purely from the attribute table. A large pool, on the order of $10^5$ training triplets plus a few thousand held out for validation, is generated once and cached, keyed to the synthesis settings, so that re-training under different model or optimiser hyperparameters reuses the same pool instead of regenerating it.
+**Hard negatives:** When enabled, one **constraint-violating** distractor $h$ is mined per query: a real image that satisfies every requested edit but one, which it violates. For the query `-Smiling`, this is a face that is otherwise valid yet still smiling. Because it resembles the target in every respect except the single edited attribute, using it as a negative forces the model to key on the requested change rather than on overall similarity to the source. It is the primary defense against the failure mode where the network simply returns look-alikes of the reference. When no such image exists for a query, that row falls back to its in-batch negatives alone.
 
-**Hard negatives.** When enabled, one **constraint-violating** distractor $h$ is mined per query: a real image that keeps the reference's other attributes but breaks exactly one requested sign (for the query $-\text{Smiling}$, a face that is otherwise valid yet still smiling). Such an image is close to the target in every respect except the single attribute the query cares about, so using it as a negative forces the model to key on the edited attribute rather than on overall resemblance to the source. This is the main defence against the failure mode where a combiner simply returns look-alikes of the reference. Queries for which no such image exists in the split fall back to using only the in-batch negatives for that row.
+**InfoNCE objective** [(van den Oord et al., 2018)](https://arxiv.org/abs/1807.03748): To optimize the model, we employ the InfoNCE loss over a batch of $B$ triplets:
 
-**InfoNCE objective** [(van den Oord et al., 2018)](https://arxiv.org/abs/1807.03748). For a batch of $B$ triplets, let $\mathbf{q}_i=\Phi_\theta(\mathbf{v}_{s_i},q_i)$ be the fused query, $\mathbf{t}_i$ the embedding of its positive target, $\mathbf{h}_i$ its optional hard negative, and $\tau$ CLIP's own (frozen) temperature. Every other target in the batch acts as an in-batch negative, and the per-row hard negative is appended as one extra negative, giving the cross-entropy
-$$\mathcal{L}=-\frac{1}{B}\sum_{i=1}^{B}\log\frac{\exp(\tau\,\mathbf{q}_i^{\top}\mathbf{t}_i)}{\displaystyle\sum_{j=1}^{B}\exp(\tau\,\mathbf{q}_i^{\top}\mathbf{t}_j)\;+\;\mathbb{1}[h_i\ \text{exists}]\,\exp(\tau\,\mathbf{q}_i^{\top}\mathbf{h}_i)}.$$
-Minimising $\mathcal{L}$ raises the cosine similarity between each fused query and its true target while lowering it against the $B-1$ other targets and the hard negative. Because every embedding is unit-norm and the temperature matches CLIP's, the geometry the loss optimises is exactly the one the retrieval scorer uses at test time, so improvements on the objective translate directly into retrieval gains.
+$$\mathcal{L}=-\frac{1}{B}\sum_{i=1}^{B}\log\frac{\exp(\tau\,\mathbf{q}_i^{\top}\mathbf{t}_i)}{\displaystyle\sum_{j=1}^{B}\exp(\tau\,\mathbf{q}_i^{\top}\mathbf{t}_j)\;+\;\mathbb{1}[h_i\ \text{exists}]\,\exp(\tau\,\mathbf{q}_i^{\top}\mathbf{h}_i)}$$
 
-**Optimisation and model selection.** Only the fusion module $\Phi_\theta$ receives gradients; CLIP's image and text encoders and the attribute text bank are frozen, and the image features of the training split are pre-extracted once so each step runs only the small module rather than the backbone. We optimise with AdamW (learning rate $2\times10^{-4}$, weight decay $10^{-2}$) under a cosine-annealed learning-rate schedule over 20 epochs with batch size 512, relying on dropout inside the decoder and the fusion heads together with weight decay for regularisation. After every epoch we measure Recall@10 on the held-out triplets: each fused validation query is ranked against the whole training gallery with the source excluded, and a hit is counted when a returned image both satisfies the query and lies within the Hamming budget of the ideal target, exactly the benchmark rule. The checkpoint with the best validation Recall@10 is kept, and on later runs that cached checkpoint is reloaded so evaluation never requires re-training.
+Here, the fused query $\mathbf{q}_i$ is evaluated against its positive target $\mathbf{t}_i$, $B-1$ in-batch negative targets $\mathbf{t}_j$, and an optional hard negative $\mathbf{h}_i$ modulated by the indicator function $\mathbb{1}$. The frozen parameter $\tau$ scales the dot products according to CLIP's temperature.
+Minimizing $\mathcal{L}$ maximizes the similarity between the query and its true target while minimizing it against all negative distractors. 
+
+**Optimisation:** We optimize the model using **AdamW** which is well-suited for this architecture. Because its per-parameter adaptive step sizes accommodate the diverse gradient scales of our heterogeneous modules, while decoupled weight decay provides effective regularization. The learning rate follows a **cosine-annealed schedule** over the epochs, decaying smoothly to zero to promote stable convergence. We use a large batch size to enrich the InfoNCE objective with a higher volume of in-batch contrastive negatives. To prevent overfitting on the synthetic triplets, we combine weight decay with a dropout rate in the decoder and fusion heads.
+
+**Early Stopping:** A held-out set of validation triplets is scored once per epoch with the same InfoNCE loss used for training, with a baseline value also recorded for the untrained model before the first epoch. Whenever the validation loss reaches a new minimum, we snapshot the module's weights as the current best and immediately write that checkpoint to disk, so an interrupted run loses at most the epochs since the last improvement.
 
 ### Scorer
 
 At evaluation the scorer builds **one** composite query embedding per source image and ranks the frozen gallery against it.
 
 1. Parse the query string (`+A & -B & …`) into attribute indices and signs.
-2. Fuse the source embedding with its conditions through the trained module $\Phi_\theta$ (its output is already L2-normalised):
-
-$$\mathbf{q} \;=\; \Phi_\theta\!\big(\mathbf{v}_{\text{ref}},\, \{(\mathbf{t}_a, s_a)\}\big), \qquad \lVert \mathbf{q} \rVert_2 = 1,$$
-
-where $\mathbf{t}_a$ is the frozen CLIP text vector of attribute $a$ and $s_a \in \{+1, -1\}$ its sign.
-
-3. Score the gallery by dot product and retrieve the top-$K$, excluding the source:
-
-$$\mathcal{R}_K \;=\; \operatorname{top\text{-}}K \,\{\, \mathbf{g}_i^{\top}\mathbf{q} \;:\; i \neq \text{ref} \,\}.$$
+2. Fuse the source embedding with its conditions through the trained module $\Phi_\theta$ (its output is already L2-normalised)
 
 ### Cross-Attention: Qualitative Inspection
 
