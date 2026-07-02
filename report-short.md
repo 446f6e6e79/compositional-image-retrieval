@@ -160,13 +160,21 @@ The per-attribute banks are ensembled over [CLIP's official ImageNet prompt temp
 
 ## Other experiments
 
-Before settling on cross-attention, two other *learned* methods were built and then dropped. Both keep CLIP frozen and learn a different piece of the pipeline, and both reuse the existing evaluation harness, so each slots in as a drop-in replacement for either the embedding bank or the edit rule.
+Prior to adopting cross-attention, two alternative trained-based approaches were evaluated:
 
-**CoOp (Context Optimization, [Zhou et al. 2022](https://arxiv.org/abs/2109.01134)).** Instead of writing the prompt prefix by hand, CoOp learns it: the handcrafted words in front of each attribute are replaced by $M=16$ continuous context vectors that live in CLIP's word-embedding space and are shared across all 40 attributes. We frame CelebA as multi-label classification, building a positive prompt ("a person with {attribute}") and a negative prompt ("a person without {attribute}") for every attribute, and train the shared context (about $M\times 512\approx 8\text{k}$ parameters) with binary cross-entropy on the per-attribute margin $\cos(\text{img},e_+)-\cos(\text{img},e_-)$. The learned positive/negative text bank then drops into the *same* profile-matching scorer the training-free methods use, with the same weights. It trained cleanly and slightly edged the hand-written banks, but gave no decisive gain: the bottleneck is the fixed additive fusion, not the prompt wording.
+**CoOp (Context Optimization, [Zhou et al. 2022](https://arxiv.org/abs/2109.01134)):** Instead of utilizing handcrafted prompt prefixes, we employ CoOp to learn a set of $M=16$ continuous context vectors within CLIP’s word-embedding space, which are shared across all attributes. Once trained, this learned positive/negative text bank integrates directly into the same profile-matching scorer, utilizing identical weights.
 
-**TopK-SAE concept editing ([Gao et al. 2024](https://arxiv.org/abs/2406.04093)).** This route learns the *representation* rather than the prompt. A TopK sparse autoencoder is trained, with no labels and no text, to reconstruct the cached CLIP image embeddings through an overcomplete dictionary of $H=4096$ unit-norm atoms, each a direction in CLIP space; sparsity pushes those atoms toward near-monosemantic concepts. A textual condition is grounded zero-shot onto its top few atoms (cosine affinity, mean-centred to drop the shared text direction), and the source is edited along only those atoms, $\mathbf{v}_{\text{target}}=\mathbf{v}_s+\sum_c\sigma_c\,\gamma_c\,\hat{\mathbf{u}}_c$, leaving every other atom untouched so identity is preserved for free. Reconstruction was faithful enough for retrieval (the residual is inert), but the edit direction was the failure point: a query attribute seldom grounds onto a single clean, monosemantic atom, so the added term behaved as noise and could not reliably realise the attribute.
+While this optimization showed marginal improvements over prompt ensembling, it was ultimately excluded because the primary bottleneck resides in the fusion mechanism rather than prompt enrichment. Consequently, we chose to dedicate our investigation entirely to advancing architectural fusion strategies rather than tuning representation inputs.
 
-Both methods leave the image-condition *interaction* hand-designed. Cross-attention learns that interaction instead.
+**TopK-SAE Concept Editing ([Gao et al. 2024](https://arxiv.org/abs/2406.04093)):** This approach explores a representation-level modification aimed at extending CLIP while strictly preserving its zero-shot capabilities. To achieve this, a **TopK sparse autoencoder** is trained in an unsupervised manner to reconstruct cached CLIP image embeddings using an overcomplete dictionary of $H=4096$ unit-norm atoms, each isolating a specific directional feature.
+
+At retrieval time, textual conditions are grounded zero-shot onto their highest-affinity atoms via mean-centered cosine similarity. The source image embedding is subsequently modified by shifting it exclusively along these selected atomic vectors, while the source identity is preserved via the unmodified residual embedding:
+
+$$\mathbf{v}_{\text{target}} = \mathbf{v}_s + \sum_c \sigma_c \, \gamma_c \, \hat{\mathbf{u}}_c$$
+
+Where $\mathbf{v}_{\text{target}}$ is the edited query embedding, $\mathbf{v}_s$ is the source embedding, $\hat{\mathbf{u}}_c$ is the unit-norm dictionary atom for condition $c$, $\sigma_c \in \{+1, -1\}$ is the condition sign, and $\gamma_c \ge 0$ is the retrieval-time edit magnitude.
+
+Despite providing high-fidelity reconstructions, this approach failed to deliver decisive gains over the baseline. Query attributes rarely align cleanly with isolated monosemantic atoms. As a result, editing the grounded atoms injects unexpected semantic noise rather than precisely altering the intended attribute.
 
 ---
 
