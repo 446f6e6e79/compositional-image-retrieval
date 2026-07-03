@@ -6,7 +6,7 @@
 CELEBA_ROOT = Path("/content/datasets")
 BENCHMARK_ANNOTATIONS_PATH = Path("/content/drive/MyDrive/datasets/celeba_evaluation.json")
 EVALUATION_CACHE_DIR = Path("/content/drive/MyDrive/datasets/clip_cache")
-EVALUATION_CACHE_PATH = EVALUATION_CACHE_DIR / "embeddings.pt"
+GALLERY_FEATS_PATH = EVALUATION_CACHE_DIR / "embeddings.pt"   # test-split (gallery) CLIP features
 
 
 #==============================================================================
@@ -18,6 +18,7 @@ MODEL_NAME = "openai/clip-vit-base-patch32"
 _model = None
 _processor = None
 
+
 def get_CLIP_model():
     """Lazily load and cache the CLIP model and processor.
 
@@ -25,7 +26,7 @@ def get_CLIP_model():
         The cached (model, processor) pair, with the model on `device` and in eval mode.
     """
     global _model, _processor
-    
+
     if _model is None:
         print("Loading CLIP model...")
         _model = CLIPModel.from_pretrained(MODEL_NAME).to(device)
@@ -34,6 +35,7 @@ def get_CLIP_model():
     if _processor is None:
         _processor = CLIPProcessor.from_pretrained(MODEL_NAME)
     return _model, _processor
+
 
 def _as_feature_tensor(out) -> torch.Tensor:
     """Normalize a CLIP feature output into a plain Tensor.
@@ -58,6 +60,7 @@ def _as_feature_tensor(out) -> torch.Tensor:
         return out[0]
     raise TypeError(f"Unexpected feature output type: {type(out)}")
 
+
 @torch.no_grad()
 def encode_texts(prompts: list[str], device) -> torch.Tensor:
     """Encode a batch of text prompts with CLIP in one call.
@@ -74,32 +77,25 @@ def encode_texts(prompts: list[str], device) -> torch.Tensor:
     embs = _as_feature_tensor(model.get_text_features(**inputs))
     return F.normalize(embs, p=2, dim=-1)
 
-def _collate_keep_pil(batch):
-    """
-    Custom collate function for a PyTorch DataLoader that preserves images as
-    PIL.Image objects while batching the corresponding labels.
 
-    Unlike PyTorch's default ``collate_fn``, this function does not attempt to
-    convert or stack the images into a tensor. Instead, it returns the images
-    as a Python list, allowing downstream code (e.g., a CLIP processor) to
-    perform its own preprocessing. The labels are stacked along the first
-    dimension to form a batched tensor.
+def _collate_keep_pil(batch):
+    """Collate (image, label) samples, keeping the images as PIL objects.
+
+    Unlike PyTorch's default ``collate_fn``, the images are returned as a plain
+    Python list (so the CLIP processor can do its own preprocessing) while the
+    labels are stacked into a single batched tensor.
 
     Args:
-        batch (list[tuple[PIL.Image.Image, torch.Tensor]]):
-            A list of samples produced by the dataset, where each sample is a
-            ``(image, label)`` tuple. The image is a PIL Image and the label is
-            a tensor.
+        batch: List of (image, label) samples produced by the dataset.
 
     Returns:
-        tuple[list[PIL.Image.Image], torch.Tensor]:
-            A tuple containing:
-                - A list of PIL images in the same order as the input batch.
-                - A tensor containing the stacked labels with shape ``(batch_size, ...)``.
+        An (images, labels) pair: a list of PIL images in batch order and the
+        stacked (B, ...) label tensor.
     """
     imgs = [item[0] for item in batch]
     lbls = torch.stack([item[1] for item in batch], dim=0)
     return imgs, lbls
+
 
 def _encode_dataset(
     dataset,
@@ -135,7 +131,7 @@ def _encode_dataset(
     """
     model, processor = get_CLIP_model()
     source = dataset if indices is None else torch.utils.data.Subset(dataset, list(indices))
-    # Use a buffered data loader
+    # Stream batches in dataset order; the collate keeps PIL images for the CLIP processor
     loader = torch.utils.data.DataLoader(
         source,
         batch_size=batch_size,
@@ -163,6 +159,7 @@ def _encode_dataset(
 
     labels = torch.cat(labels_list, dim=0) if keep_labels else None
     return encoded, labels
+
 
 def _load_or_encode(
     cache_path: str | Path,
@@ -199,6 +196,7 @@ def _load_or_encode(
     print(f"Saved to {cache_path}.")
     return result
 
+
 @torch.no_grad()
 def get_encoded_dataset(
     dataset,
@@ -221,7 +219,7 @@ def get_encoded_dataset(
         row; labels (N, ...) on CPU, as produced by the dataset.
     """
     model, _ = get_CLIP_model()
-    embed_dim = model.config.projection_dim  # adjust if your CLIP config exposes this differently
+    embed_dim = model.config.projection_dim
 
     def encode_batch(model, inputs) -> torch.Tensor:
         e = _as_feature_tensor(model.get_image_features(**inputs))
@@ -241,6 +239,7 @@ def get_encoded_dataset(
 
     return _load_or_encode(cache_path, encode_pass, from_cache=from_cache)
 
+
 @torch.no_grad()
 def get_encoded_patches(
     dataset,
@@ -252,12 +251,13 @@ def get_encoded_patches(
 ) -> torch.Tensor:
     """Encode images into CLIP's per-token visual sequence, with caching.
 
-    Each image's visual embedding is exactly two things concatenated: 
-    - one **CLS token**: CLIP's learned global summary of the whole image, not a patch
-    - 49 spatial patch tokens. 
-    
-    This function accesses the vision tower's ``last_hidden_state`` to retrieve both, giving the fusion module spatially grounded
-    conditions.
+    Each image's visual sequence is exactly two things concatenated:
+    - one CLS token: CLIP's learned global summary of the whole image, not a patch;
+    - 49 spatial patch tokens.
+
+    Both come from the vision tower's ``last_hidden_state``, giving the fusion
+    module spatially grounded conditions.
+
     Args:
         dataset: Dataset yielding (image, label) pairs.
         device: Device the CLIP forward runs on.
@@ -265,6 +265,7 @@ def get_encoded_patches(
         indices: Optional subset of dataset indices to encode (in this order). None encodes all.
         batch_size: DataLoader batch size.
         num_workers: DataLoader worker count.
+
     Returns:
         A (len(indices) or N, 50, 768) fp16 tensor of visual tokens on CPU, row-aligned to
         `indices` (or to the dataset order when `indices` is None).
@@ -293,9 +294,9 @@ def get_encoded_patches(
 
     return _load_or_encode(cache_path, encode_pass, from_cache=from_cache)
 
+
 def build_patch_bank(dataset, device, cache_path, source_indices: list[int], total_size: int) -> Callable:
-    """
-    Load visual tokens for a dataset subset and return an index-based getter.
+    """Load visual tokens for a dataset subset and return an index-based getter.
 
     Args:
         dataset: Dataset yielding (image, label) pairs.
@@ -326,6 +327,7 @@ def build_patch_bank(dataset, device, cache_path, source_indices: list[int], tot
 
 _attribute_cache: list[str] | None = None
 
+
 def get_attributes(dataset=None) -> list[str]:
     """Return the dataset's attribute names, filtering out any empty strings.
 
@@ -349,6 +351,7 @@ def get_attributes(dataset=None) -> list[str]:
 
 
 _attribute_index_cache: dict[str, int] | None = None
+
 
 def attribute_to_index(name: str) -> int:
     """Return the column index of a CelebA attribute name.
@@ -378,9 +381,10 @@ def index_to_attribute(index: int) -> str:
 
 
 def query_to_signed_indices(text_query: str) -> tuple[list[int], list[int]]:
-    """Shared Query parser. Does two things at once:
-    - Splits each comma-separated term into its "+" / "-" sign.
-    - Maps the attribute name to its column index.
+    """Parse a signed text query into "+" and "-" attribute-index lists.
+
+    The shared query parser: splits each comma-separated term into its sign and
+    attribute name, and maps the name to its label-column index.
 
     Args:
         text_query: Comma-separated signed query, e.g. "+Bald, -Eyeglasses".
@@ -400,6 +404,7 @@ def query_to_signed_indices(text_query: str) -> tuple[list[int], list[int]]:
 
 
 _attribute_name_embs_cache: torch.Tensor | None = None
+
 
 def get_attribute_name_embeddings(device) -> torch.Tensor:
     """Lazily encode and cache the cleaned attribute-name CLIP text bank for the 40 attributes.
@@ -437,20 +442,19 @@ def plot_images(celeba_dataset: object, indices: list[int], n_cols: int, n_rows:
     """
     if len(indices) > n_cols * n_rows:
         raise ValueError("Number of indices exceeds the grid capacity")
-    
-    _, axes = plt.subplots(n_rows, n_cols, figsize=figsize)
 
+    _, axes = plt.subplots(n_rows, n_cols, figsize=figsize, squeeze=False)
+
+    # Blank every cell up front so a partially filled last row shows no empty frames
+    for ax in axes.flat:
+        ax.axis("off")
     for counter, img_idx in enumerate(indices):
         img, _ = celeba_dataset[img_idx]
-        if n_rows == 1:
-            ax = axes[counter % n_cols]
-        else:
-            ax = axes[counter // n_cols, counter % n_cols]
-        ax.imshow(img)
-        ax.axis('off')
+        axes[counter // n_cols, counter % n_cols].imshow(img)
 
     plt.tight_layout()
     plt.show()
+
 
 def plot_image_row(images, titles=None, title_colors=None, figsize=None):
     """Plot a single row of images with optional per-image titles and colors.
@@ -466,7 +470,7 @@ def plot_image_row(images, titles=None, title_colors=None, figsize=None):
         figsize: Optional figure size as (width, height); defaults to a size scaled by image count.
     """
     n = len(images)
-    fig, axes = plt.subplots(1, n, figsize=figsize or (3 * n, 3.2))
+    _, axes = plt.subplots(1, n, figsize=figsize or (3 * n, 3.2))
     if n == 1:
         axes = [axes]
     for i, (ax, img) in enumerate(zip(axes, images)):
@@ -481,6 +485,7 @@ def plot_image_row(images, titles=None, title_colors=None, figsize=None):
     plt.tight_layout()
     plt.show()
 
+
 def plot_image_with_attributes(idx: int, figsize: tuple[int, int]=(10, 5)):
     """Plot a single image with its active attributes listed as text alongside it.
 
@@ -489,21 +494,14 @@ def plot_image_with_attributes(idx: int, figsize: tuple[int, int]=(10, 5)):
         figsize: Figure size as (width, height).
     """
     img, labels = celeba[idx]
-    active_attrs = [index_to_attribute(idx) for idx, value in enumerate(labels) if value == 1]
+    active_attrs = [index_to_attribute(j) for j, value in enumerate(labels) if value == 1]
 
-    fig, (ax_img, ax_text) = plt.subplots(1, 2, figsize=figsize)
+    _, (ax_img, ax_text) = plt.subplots(1, 2, figsize=figsize)
     ax_img.imshow(img)
-    ax_img.axis('off')
+    ax_img.axis("off")
 
-    ax_text.axis('off')
-    text = "\n".join(active_attrs)
-
-    ax_text.text(
-        0.5, 0.5, text,
-        fontsize=10,
-        ha='center',   
-        va='center'    
-    )
+    ax_text.axis("off")
+    ax_text.text(0.5, 0.5, "\n".join(active_attrs), fontsize=10, ha="center", va="center")
 
     plt.tight_layout()
     plt.show()
@@ -553,6 +551,7 @@ def plot_metrics_across_k(average_results_per_query: list[dict], title: str = "R
     plt.tight_layout()
     plt.show()
 
+
 def plot_methods_comparison(method_results: dict[str, list[dict]], title: str = "Method Comparison across queries"):
     """Plot a per-query line comparison of N retrieval methods.
 
@@ -600,6 +599,7 @@ def plot_methods_comparison(method_results: dict[str, list[dict]], title: str = 
     plt.tight_layout()
     plt.show()
 
+
 def plot_results_table(
     method_results: dict[str, list[dict]],
     title: str = "Method Comparison — summary table",
@@ -609,7 +609,7 @@ def plot_results_table(
     """Render a summary table of mean Recall@K / Precision@K per method.
 
     Rows are methods and columns are mean Recall@K / Precision@K. Each cell is the
-    mean over queries of the per-query average — the same aggregation used by
+    mean over queries of the per-query average - the same aggregation used by
     plot_methods_comparison. The best method per column is highlighted (bold + shaded).
 
     Args:
@@ -660,7 +660,7 @@ def plot_results_table(
 
 celeba = CelebA(root=CELEBA_ROOT, split="test", download=False)
 
-# This should be 19.962
+# The test split should contain 19,962 samples
 print("Number of samples:", len(celeba))
 
 # Show element size
@@ -695,10 +695,12 @@ for attr, count, freq in zip(get_attributes(celeba), attr_counts, attr_freq):
 # Cell  22 [code] - Attribute name/index maps & retrieve_by_attributes
 #==============================================================================
 
-def retrieve_by_attributes(query:dict):
+def retrieve_by_attributes(query: dict) -> list[int]:
     """Retrieve all dataset images that satisfy the given attribute conditions.
+
     Args:
         query: Dict mapping attribute name to "+" (must have the attribute) or "-" (must not have the attribute).
+
     Returns:
         Indices of images that satisfy every specified condition.
     """
@@ -732,10 +734,11 @@ plot_image_with_attributes(IMAGE_INDEX)
 
 # YOU CAN CHANGE THIS QUERY TO TEST DIFFERENT ATTRIBUTE COMBINATIONS.
 # RERUN THE CELL TO SEE THE RESULTS.
-test_query = {"Bald": "+",
-           "Smiling": "+",
-           "Eyeglasses": "-",
-           }
+test_query = {
+    "Bald": "+",
+    "Smiling": "+",
+    "Eyeglasses": "-",
+}
 
 retrieved_images = retrieve_by_attributes(test_query)
 print(f"Number of retrieved images: {len(retrieved_images)}")
@@ -756,7 +759,7 @@ else:
 #==============================================================================
 
 # Get the encoded dataset, using cached features if available
-gallery_embeddings, gallery_labels = get_encoded_dataset(celeba, device, EVALUATION_CACHE_PATH, batch_size=128)
+gallery_embeddings, gallery_labels = get_encoded_dataset(celeba, device, GALLERY_FEATS_PATH, batch_size=128)
 
 
 #==============================================================================
@@ -790,8 +793,10 @@ plot_image_row(images, titles=titles, title_colors=title_colors, figsize=(25, 5)
 
 def _select_pure_image_idxs(all_labels: np.ndarray, rng: np.random.Generator) -> list[int]:
     """Return a list of image indices, one per attribute, that are "pure" positives for that attribute.
-    A "pure" positive is defined as an image that has the attribute in question and has the least number of other attributes. 
-    If multiple images have the same minimal number of other attributes, one is chosen at random.
+
+    A "pure" positive is defined as an image that has the attribute in question and has the least
+    number of other attributes. If multiple images have the same minimal number of other
+    attributes, one is chosen at random.
 
     Args:
         all_labels: (N, n_attrs) binary attribute-label matrix.
@@ -850,8 +855,7 @@ def _print_cosine_diagnostics(cos_mat: np.ndarray) -> None:
     print(f"Diagonal-argmax rate:      {diag_argmax_rate:.2%} (attributes where the matching image is the row's argmax)")
 
 
-rng = np.random.default_rng(seed=0)
-selected_idxs = _select_pure_image_idxs(all_labels, rng)
+selected_idxs = _select_pure_image_idxs(all_labels, np.random.default_rng(seed=0))
 selected_img_embs = gallery_embeddings[selected_idxs].to(device)
 
 cos_mat = (get_attribute_name_embeddings(device) @ selected_img_embs.T).detach().cpu().numpy()
@@ -936,20 +940,21 @@ with open(BENCHMARK_ANNOTATIONS_PATH, "r") as f:
 print(f"Loaded {len(annotations)} queries!")
 
 # Display a sample annotation to understand the structure of the data
-print("Sample annotation shape", annotations[0].keys())
+print("Annotation keys:", list(annotations[0].keys()))
 
 # Extract and print first text query
 print("Text-Query example:", annotations[0].get("query", ""))
 
 # Extract and print the source image ID for the first annotation
-print("Source-Image example:", list(annotations[0].get("ground_truth", {}).keys())[:5],"...")
+print("Source-Image example:", list(annotations[0].get("ground_truth", {}).keys())[:5], "...")
 
 # Extract and print the list of ground truth indices for the first annotation
 print("List of ground truth indices for the first annotation:", annotations[0].get("ground_truth", {}).get("13", [])[:5], "...")
 
 #==============================================================================
-# Cell  42 [code] - Helper functions to extract query and ground-truth info from benchmark annotations
+# Cell  44 [code] - Helper functions to extract query and ground-truth info from benchmark annotations
 #==============================================================================
+
 def get_text_query(annotation: dict) -> str:
     """Extract the text query from a benchmark annotation.
 
@@ -960,6 +965,7 @@ def get_text_query(annotation: dict) -> str:
         The text query string (e.g. "+glasses, -smile").
     """
     return annotation.get("query", "")
+
 
 def get_source_image_idxs(annotation: dict) -> list[int]:
     """Extract the source image IDs from a benchmark annotation.
@@ -972,6 +978,7 @@ def get_source_image_idxs(annotation: dict) -> list[int]:
     """
     # The "ground_truth" keys must be converted to int since JSON keys are always strings
     return [int(key) for key in annotation.get("ground_truth", {}).keys()]
+
 
 def get_target_indices(annotation: dict, source_image_idx: int) -> list[int]:
     """Extract the target image IDs for a given source image from a benchmark annotation.
@@ -1106,7 +1113,7 @@ def compute_query_average_results(query_evaluation_results: dict) -> dict:
         precision_vals = [m[f"Precision@{k}"] for m in query_evaluation_results.values()]
 
         # Average each metric and attach its 95% confidence interval (empirical-std based; see
-        # _mean_and_ci — the naive Bernoulli formula only applies to Recall, not Precision)
+        # _mean_and_ci - the naive Bernoulli formula only applies to Recall, not Precision)
         average_results[f"Recall@{k}"], average_results[f"Recall@{k}_CI"] = _mean_and_ci(recall_vals)
         average_results[f"Precision@{k}"], average_results[f"Precision@{k}_CI"] = _mean_and_ci(precision_vals)
 
@@ -1123,7 +1130,7 @@ def evaluate_and_average(annotations: list[dict], make_scorer: Callable, verbose
 
     Returns:
         A (evaluation_results, average_results_per_query) pair: the raw per-source metrics
-        (for mean_recall_at_10) and the per-query averages (for plotting) — the pair every
+        (for mean_recall_at_10) and the per-query averages (for plotting) - the pair every
         method downstream needs.
     """
     results = evaluate(annotations, make_scorer, verbose=verbose)
@@ -1145,9 +1152,10 @@ def baseline_scorer(gallery_embeddings: torch.Tensor) -> Callable:
     Returns:
         A ``make_scorer(annotation)`` factory consumed by evaluate().
     """
+    attr_name_embs = get_attribute_name_embeddings(gallery_embeddings.device)
+
     def make_scorer(annotation: dict) -> Callable:
         """Build a per-query scorer from the query's signed attribute delta."""
-        attr_name_embs = get_attribute_name_embeddings(gallery_embeddings.device)
         pos_idx, neg_idx = query_to_signed_indices(get_text_query(annotation))
         # Initialize delta vector to zero, then add/subtract attribute embeddings based on the query
         delta = torch.zeros(gallery_embeddings.shape[1], device=gallery_embeddings.device)
@@ -1279,7 +1287,7 @@ print(f"CelebA train split size: {len(celeba_train)}")
 train_embeddings, train_labels = get_encoded_dataset(
     celeba_train, device, TRAIN_FEATS_PATH, batch_size=128
 )
-print(f"train_features dtype: {train_embeddings.dtype}, device: {train_embeddings.device}")
+print(f"train_embeddings dtype: {train_embeddings.dtype}, device: {train_embeddings.device}")
 
 train_labels_bool = (train_labels.to(device) > 0)        # (M, 40) on GPU, for candidate filtering
 train_labels_bool_np = train_labels_bool.cpu().numpy()   # CPU copy, for cheap per-sample query sampling
@@ -1296,7 +1304,7 @@ VAL_MAX_SOURCES   = 50   # cap sources per query to bound grid-search cost
 VAL_MIN_TARGETS   = 5    # benchmark rule: a source needs >= 5 valid targets
 VAL_SOURCE_TRIES  = 2000 # sampled source candidates per query before giving up
 VAL_SEEDS         = [12, 34, 56]  # independent query draws averaged in the grid search below, so
-                                   # the chosen weights aren't just the ones that got lucky on one draw
+                                  # the chosen weights aren't just the ones that got lucky on one draw
 
 
 def build_validation_annotations(
@@ -1307,14 +1315,12 @@ def build_validation_annotations(
     min_targets: int = VAL_MIN_TARGETS,
     source_tries: int = VAL_SOURCE_TRIES,
 ) -> list[dict]:
-    """
-    Build benchmark-shaped annotations from random signed queries over a label pool.
+    """Build benchmark-shaped annotations from random signed queries over a label pool.
 
     Mirrors the benchmark construction: each annotation pairs a signed query with sources
     that have at least `min_targets` valid targets under the Hamming rule
-    (find_valid_targets). 
-    Emitting the exact benchmark JSON shape means evaluate() and every scorer factory 
-    can be reused unchanged for hyperparameter tuning.
+    (find_valid_targets). Emitting the exact benchmark JSON shape means evaluate() and
+    every scorer factory can be reused unchanged for hyperparameter tuning.
 
     Args:
         labels_bool: (N, n_attrs) boolean label matrix of the pool (e.g. the train split).
@@ -1349,7 +1355,7 @@ def build_validation_annotations(
             if len(ground_truth) >= max_sources:
                 break
         if not ground_truth:
-            continue   # degenerate query (e.g. contradictory attributes) — resample
+            continue   # degenerate query (e.g. contradictory attributes) - resample
 
         query = ", ".join([f"+{names[j]}" for j in pos_idx] + [f"-{names[j]}" for j in neg_idx])
         annotations_out.append({"query": query, "ground_truth": ground_truth})
@@ -1422,11 +1428,10 @@ def attribute_matching_scorer(
     """Scorer factory for attribute-attribute vector matching.
 
     Pre-computes the z-scored attribute logit matrix once, then returns a
-    ``make_scorer`` closure that pre-computes the per-query constraint vector
-    once, and an inner per-source ``scorer`` closure:
+    ``make_scorer`` closure that pre-computes the per-query constraint vector once;
+    the inner per-source ``scorer`` only slices rows and sums.
 
-
-    Used by Source-Attribute Matching and Prompt Ensembling — they differ only in E_pos/E_neg.
+    Used by Source-Attribute Matching and Prompt Ensembling - they differ only in E_pos/E_neg.
 
     Args:
         gallery_embeddings: (N, D) gallery image embeddings, L2-normalized per row.
@@ -1554,7 +1559,7 @@ attribute_descriptions_pos = {
 }
 
 # Linguistic negatives. We avoid the "not X" construction wherever possible because
-# CLIP's text encoder attends to the object token regardless of the "not" — phrasing
+# CLIP's text encoder attends to the object token regardless of the "not" - phrasing
 # matters. Where a clean linguistic opposite exists (e.g. clean-shaven vs bearded)
 # we use it; otherwise we lean on "without {attr}" / "no {attr}" framings.
 attribute_descriptions_neg = {
@@ -1698,7 +1703,7 @@ print(f"E_POS: {tuple(E_POS.shape)},  E_NEG: {tuple(E_NEG.shape)}")
 # Cell  73 [code] - Evaluate & plot Prompt Ensembling
 #==============================================================================
 
-# Same scoring layer and weights as Source-Attribute Matching — only the embedding bank changes.
+# Same scoring layer and weights as Source-Attribute Matching - only the embedding bank changes.
 evaluation_results_promptens, average_results_per_query_promptens = evaluate_and_average(
     annotations,
     attribute_matching_scorer(gallery_embeddings, E_POS, E_NEG, **SAM_WEIGHTS),
@@ -1709,9 +1714,9 @@ print(f"Prompt Ensembling: mean Recall@10 = {mean_recall_at_10(evaluation_result
 
 plot_methods_comparison(
     {
-        "Baseline":                            average_results_per_query_baseline,
-        "Source-Attribute Matching":                average_results_per_query_sam,
-        "Prompt Ensembling":  average_results_per_query_promptens,
+        "Baseline":                  average_results_per_query_baseline,
+        "Source-Attribute Matching": average_results_per_query_sam,
+        "Prompt Ensembling":         average_results_per_query_promptens,
     },
     title="Training-Free Method Comparison — per-query Recall@K and Precision@K",
 )
@@ -1824,10 +1829,11 @@ class CrossAttnPoolDecoder(nn.Module):
 
 
 class CrossAttentionFusion(nn.Module):
-    """
-    Cross-attention fusion: the source image queries its sign-tagged conditions. The
-    attended result is fused back onto the image embedding.
-    See the "Training-Based Method: Cross-Attention Fusion" section of the report for the full architecture rationale.
+    """Cross-attention fusion: the source image queries its sign-tagged conditions.
+
+    The attended result is fused back onto the image embedding. See the
+    "Training-Based Method: Cross-Attention Fusion" section of the report for the
+    full architecture rationale.
     """
 
     def __init__(self, attr_name_embs: torch.Tensor, dim: int, n_heads: int = 4,
@@ -1835,6 +1841,7 @@ class CrossAttentionFusion(nn.Module):
                  film_sign_std: float = 0.02, gate_bias_init: float = 2.0,
                  clip_dim: int = 768, ground_layers: int = 1, ground_heads: int = 4):
         """Build the cross-attention fusion module.
+
         Args:
             attr_name_embs: (n_attrs, D) frozen cleaned attribute-name CLIP text bank.
             dim: Embedding dimension D.
@@ -1866,7 +1873,7 @@ class CrossAttentionFusion(nn.Module):
         # Patch grounding: project frozen CLIP visual tokens back into the fusion dimension
         self.vis_proj = nn.Linear(clip_dim, dim)             # (B, 50, clip_dim) -> (B, 50, D)
         self.vis_type = nn.Embedding(2, dim)                 # weight: (2, D)   [0: CLS, 1: patch]
-        nn.init.normal_(self.vis_type.weight, std=film_sign_std)
+        nn.init.normal_(self.vis_type.weight, std=film_sign_std)   # same small init std as the sign table
         ground_layer = nn.TransformerDecoderLayer(
             dim, ground_heads, dim_feedforward=ffn_mult * dim, dropout=dropout,
             activation="gelu", batch_first=True, norm_first=True,
@@ -1950,9 +1957,11 @@ ca_model = CrossAttentionFusion(
     clip_dim=CLIP_VIS_DIM, ground_layers=CA_GROUND_LAYERS, ground_heads=CA_GROUND_HEADS,
 ).to(device)
 
+
 #==============================================================================
-# NEW CELL, TO BE ADDED TO THE NOTEBOOK
+# Cell  84 [code] - Parameter count & forward self-check  (NEW - add to notebook)
 #==============================================================================
+
 n_params = sum(p.numel() for p in ca_model.parameters() if p.requires_grad)
 print(f"Cross-Attention trainable parameters: {n_params:,}")
 
@@ -1984,8 +1993,10 @@ def find_hard_negative(labels_bool: torch.Tensor, source_labels: torch.Tensor,
                        source_idx: int, rng) -> int:
     """Return the index of a hard negative for a source and query.
 
-    A hard negative violates the query but stays within HAMMING_BUDGET of the source.
-    Returns -1 when the query is empty or no candidate qualifies.
+    A hard negative breaks the query on exactly one sampled attribute while staying
+    within HAMMING_BUDGET of that violated ideal profile, so it resembles a valid
+    target in every other respect. Returns -1 when the query is empty or no
+    candidate qualifies.
 
     Args:
         labels_bool: (N, n_attrs) boolean candidate label matrix.
@@ -2001,7 +2012,7 @@ def find_hard_negative(labels_bool: torch.Tensor, source_labels: torch.Tensor,
     queried = pos_idx + neg_idx
     if not queried:
         return -1
-    
+
     # Compute the ideal target attribute vector for this source and query
     target = desired_target_labels(source_labels, pos_idx, neg_idx)
     # Randomly select one of the queried attributes to violate
@@ -2161,8 +2172,9 @@ logit_scale_value = model.logit_scale.exp().detach()   # Frozen CLIP temperature
 ca_trip_src_dev, ca_trip_tgt_dev = ca_trip_src.to(device), ca_trip_tgt.to(device)
 ca_trip_attr_dev, ca_trip_sign_dev = ca_trip_attr.to(device), ca_trip_sign.to(device)
 ca_trip_hard_dev = ca_trip_hard.to(device)
-ca_val_src_dev, ca_val_attr_dev, ca_val_sign_dev = ca_val_src.to(device), ca_val_attr.to(device), ca_val_sign.to(device)
-ca_val_tgt_dev, ca_val_hard_dev = ca_val_tgt.to(device), ca_val_hard.to(device)
+ca_val_src_dev, ca_val_tgt_dev = ca_val_src.to(device), ca_val_tgt.to(device)
+ca_val_attr_dev, ca_val_sign_dev = ca_val_attr.to(device), ca_val_sign.to(device)
+ca_val_hard_dev = ca_val_hard.to(device)
 
 
 def in_batch_valid_target_mask(src_idx: torch.Tensor, tgt_idx: torch.Tensor,
@@ -2256,7 +2268,8 @@ def ca_val_loss() -> float:
     n_val = ca_val_src_dev.shape[0]
     for start in range(0, n_val, CA_BATCH):
         sl = slice(start, min(start + CA_BATCH, n_val))
-        q = ca_model(train_embeddings[ca_val_src_dev[sl]], train_patches_for(ca_val_src_dev[sl]), ca_val_attr_dev[sl], ca_val_sign_dev[sl])
+        q = ca_model(train_embeddings[ca_val_src_dev[sl]], train_patches_for(ca_val_src_dev[sl]),
+                     ca_val_attr_dev[sl], ca_val_sign_dev[sl])
         vt_mask = in_batch_valid_target_mask(ca_val_src_dev[sl], ca_val_tgt_dev[sl],
                                              ca_val_attr_dev[sl], ca_val_sign_dev[sl], train_labels_bool)
         loss_sum += float(ca_infonce_loss(q, ca_val_tgt_dev[sl], ca_val_hard_dev[sl],
@@ -2348,7 +2361,8 @@ else:
         perm = torch.randperm(n_train_trip, device=device)
         for start in range(0, n_train_trip, CA_BATCH):
             idx = perm[start:start + CA_BATCH]
-            q = ca_model(train_embeddings[ca_trip_src_dev[idx]], train_patches_for(ca_trip_src_dev[idx]), ca_trip_attr_dev[idx], ca_trip_sign_dev[idx])
+            q = ca_model(train_embeddings[ca_trip_src_dev[idx]], train_patches_for(ca_trip_src_dev[idx]),
+                         ca_trip_attr_dev[idx], ca_trip_sign_dev[idx])
             vt_mask = in_batch_valid_target_mask(ca_trip_src_dev[idx], ca_trip_tgt_dev[idx],
                                                  ca_trip_attr_dev[idx], ca_trip_sign_dev[idx], train_labels_bool)
             loss = ca_infonce_loss(q, ca_trip_tgt_dev[idx], ca_trip_hard_dev[idx],
@@ -2528,7 +2542,7 @@ def plot_cross_attention_inspection(
     """Plot the source image and the top-k images the fused query retrieves, with a gate summary.
 
     Each retrieved image is annotated ✓/✗ for whether it satisfies the query attributes and, when
-    ``ground_truth`` is given, tagged "GT" if it is an actual benchmark target — so a SUCCESS panel
+    ``ground_truth`` is given, tagged "GT" if it is an actual benchmark target - so a SUCCESS panel
     visibly contains a ground-truth hit and a FAILURE panel does not. ``label`` (e.g.
     "SUCCESS (negation)") is prepended to the source caption so the figure is self-describing in the
     report. This replaces the per-condition attention bar chart: for a single-term query that bar is a
@@ -2559,8 +2573,8 @@ def plot_cross_attention_inspection(
     for idx in topk:
         ok = bool(query_satisfied(gallery_bool[idx].unsqueeze(0), pos_idx, neg_idx).item())
         tag = "✓ satisfies" if ok else "✗ violates"
-        if gt:
-            tag += "  ·  GT" if idx in gt else ""
+        if idx in gt:
+            tag += "  ·  GT"
         images.append(celeba[idx][0])
         titles.append(f"#{idx}  cos={sims[idx].item():.2f}\n{tag}")
         colors.append("green" if ok else "crimson")
@@ -2615,7 +2629,8 @@ def first_query(annotations: list[dict], predicate: Callable) -> dict | None:
     return None
 
 
-# Inspect a SUCCESS and a FAILURE case for two query types the spec calls out: a single-attribute
+# Inspect a SUCCESS and a FAILURE case for two query types the spec calls out: a
+# single-attribute negation and a composed multi-attribute query.
 INSPECT_K = 5
 inspection_queries = [
     ("negation", first_query(annotations, lambda p, n: len(n) >= 1 and len(p) + len(n) == 1)),
@@ -2645,10 +2660,10 @@ for kind, ann in inspection_queries:
 #==============================================================================
 
 all_methods_results = {
-    "Baseline":                 average_results_per_query_baseline,
-    "Source-Attribute Matching":  average_results_per_query_sam,
-    "Prompt Ensembling":        average_results_per_query_promptens,
-    "Cross-Attention":          average_results_per_query_ca,
+    "Baseline":                  average_results_per_query_baseline,
+    "Source-Attribute Matching": average_results_per_query_sam,
+    "Prompt Ensembling":         average_results_per_query_promptens,
+    "Cross-Attention":           average_results_per_query_ca,
 }
 
 plot_methods_comparison(
