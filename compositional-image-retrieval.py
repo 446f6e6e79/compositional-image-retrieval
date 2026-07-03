@@ -1743,6 +1743,86 @@ CA_GATE_BIAS_INIT = 2.0        # gated-residual gate-open bias; sigmoid(2.0)≈0
 # Cell  82 [code] - class CrossAttentionFusion(nn.Module)
 #==============================================================================
 
+class CrossAttnPoolLayer(nn.Module):
+    """Pre-norm layer: cross-attend `tgt` over `memory`, then apply a feed-forward block."""
+
+    def __init__(self, dim: int, n_heads: int, dim_feedforward: int, dropout: float = 0.1):
+        """Build one cross-attention-only pooling layer.
+
+        Args:
+            dim: Embedding dimension D.
+            n_heads: Number of cross-attention heads.
+            dim_feedforward: Hidden size of the feed-forward sub-block.
+            dropout: Dropout probability used after attention and inside the FFN.
+        """
+        super().__init__()
+        self.cross_attn = nn.MultiheadAttention(dim, n_heads, dropout=dropout, batch_first=True)
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, dim_feedforward), nn.GELU(), nn.Dropout(dropout), nn.Linear(dim_feedforward, dim),
+        )
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+
+    def forward(self, tgt: torch.Tensor, memory: torch.Tensor,
+                memory_key_padding_mask: torch.Tensor | None = None) -> torch.Tensor:
+        """Cross-attend `tgt` over `memory`, then apply the feed-forward block.
+
+        Args:
+            tgt: (B, Tq, D) query tokens.
+            memory: (B, Tm, D) keys/values to attend over.
+            memory_key_padding_mask: (B, Tm) bool mask, True marks a padded key to ignore.
+
+        Returns:
+            A (B, Tq, D) tensor, same shape as `tgt`.
+        """
+        x = tgt
+        attended, _ = self.cross_attn(
+            self.norm1(x), memory, memory,
+            key_padding_mask=memory_key_padding_mask, need_weights=False,
+        )
+        x = x + self.dropout1(attended)
+        x = x + self.dropout2(self.ffn(self.norm2(x)))
+        return x
+
+
+class CrossAttnPoolDecoder(nn.Module):
+    """Stack of `CrossAttnPoolLayer`s, each attending over the same `memory`."""
+
+    def __init__(self, dim: int, n_heads: int, n_layers: int, dim_feedforward: int, dropout: float = 0.1):
+        """Build the layer stack.
+
+        Args:
+            dim: Embedding dimension D.
+            n_heads: Number of cross-attention heads per layer.
+            n_layers: Number of stacked `CrossAttnPoolLayer`s.
+            dim_feedforward: Hidden size of each layer's feed-forward sub-block.
+            dropout: Dropout probability passed to every layer.
+        """
+        super().__init__()
+        self.layers = nn.ModuleList([
+            CrossAttnPoolLayer(dim, n_heads, dim_feedforward, dropout) for _ in range(n_layers)
+        ])
+
+    def forward(self, tgt: torch.Tensor, memory: torch.Tensor,
+                memory_key_padding_mask: torch.Tensor | None = None) -> torch.Tensor:
+        """Run `tgt` through every stacked layer, each attending over the same `memory`.
+
+        Args:
+            tgt: (B, Tq, D) query tokens.
+            memory: (B, Tm, D) keys/values to attend over.
+            memory_key_padding_mask: (B, Tm) bool mask, True marks a padded key to ignore.
+
+        Returns:
+            A (B, Tq, D) tensor, same shape as `tgt`.
+        """
+        x = tgt
+        for layer in self.layers:
+            x = layer(x, memory, memory_key_padding_mask=memory_key_padding_mask)
+        return x
+
+
 class CrossAttentionFusion(nn.Module):
     """
     Cross-attention fusion: the source image queries its sign-tagged conditions. The
@@ -1795,11 +1875,7 @@ class CrossAttentionFusion(nn.Module):
         # tgt: (B, T, D) conditions, memory: (B, 50, D) grounded visual tokens -> (B, T, D)
 
         # Stacked cross-attention: image (1 query token) attends over the grounded conditions
-        layer = nn.TransformerDecoderLayer(
-            dim, n_heads, dim_feedforward=ffn_mult * dim, dropout=dropout,
-            activation="gelu", batch_first=True, norm_first=True,
-        )
-        self.decoder = nn.TransformerDecoder(layer, num_layers=n_layers)
+        self.decoder = CrossAttnPoolDecoder(dim, n_heads, n_layers, ffn_mult * dim, dropout)
         # tgt: (B, 1, D) image query, memory: (B, T, D) conditions -> (B, 1, D)
 
         # Gated residual head: a sigmoid gate weighs a non-linear delta added back onto v_ref
