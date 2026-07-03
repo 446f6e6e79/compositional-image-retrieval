@@ -1885,7 +1885,13 @@ class CrossAttentionFusion(nn.Module):
         self.gate = nn.Sequential(nn.Linear(2 * dim, dim), nn.Sigmoid())
                                                                 # (B, 2D) -> (B, D), in (0, 1)
 
-        # Gate starts open (sigmoid(2) ~ 0.88) so the non-zero delta head receives gradient
+        # Zero-init the delta head's last layer so the module is exactly the identity map at
+        # step 0 (out = v_ref, matching the FiLM identity init); its weights still receive
+        # gradient because their inputs are non-zero
+        nn.init.zeros_(self.delta[-1].weight)
+        nn.init.zeros_(self.delta[-1].bias)
+
+        # Gate starts open (sigmoid(2) ~ 0.88) so the delta head is not doubly suppressed at init
         nn.init.constant_(self.gate[0].bias, gate_bias_init)
 
     def forward(self, img_emb: torch.Tensor, vis_tokens: torch.Tensor,
@@ -1962,6 +1968,8 @@ with torch.no_grad():
 
     assert _out.shape == (_b, gallery_embeddings.shape[1]), _out.shape
     assert torch.allclose(_out.norm(dim=-1), torch.ones(_b, device=device), atol=1e-5)
+    # Zero-init delta head -> the untrained module must be exactly the identity map
+    assert torch.allclose(_out, _img, atol=1e-5)
 
 print("Forward self-check passed:", tuple(_out.shape))
 ca_model.train()
@@ -2157,8 +2165,52 @@ ca_val_src_dev, ca_val_attr_dev, ca_val_sign_dev = ca_val_src.to(device), ca_val
 ca_val_tgt_dev, ca_val_hard_dev = ca_val_tgt.to(device), ca_val_hard.to(device)
 
 
+def in_batch_valid_target_mask(src_idx: torch.Tensor, tgt_idx: torch.Tensor,
+                               cond_attr: torch.Tensor, cond_sign: torch.Tensor,
+                               labels_bool: torch.Tensor) -> torch.Tensor:
+    """Mark which in-batch targets are valid targets for each row's (source, query) pair.
+
+    Applies find_valid_targets' ground-truth rule (query satisfied AND within
+    HAMMING_BUDGET of the ideal target vector) to every (row, batch target) pair at once.
+    ca_infonce_loss uses this to drop *false negatives* from its denominator: with
+    Hamming-close CelebA faces and large batches, another row's target regularly happens
+    to satisfy row i's query too, and pushing the fused query away from a genuinely
+    correct candidate would directly fight the retrieval objective.
+
+    Args:
+        src_idx: (B,) source image indices per row, into `labels_bool`.
+        tgt_idx: (B,) positive-target image indices per row, into `labels_bool`.
+        cond_attr: (B, T) attribute indices for each condition.
+        cond_sign: (B, T) signs in {+1, -1, 0}; 0 marks padding.
+        labels_bool: (N, n_attrs) boolean label matrix the indices refer to.
+
+    Returns:
+        A (B, B) boolean mask, True at (i, j) iff batch target j is a valid target for
+        row i. The diagonal (each row's own positive) is True by construction.
+    """
+    active = cond_sign != 0                                            # (B, T)
+    want   = cond_sign > 0                                             # (B, T)
+
+    # Ideal target vector per row: source labels with the queried attributes forced on/off
+    # (vectorized desired_target_labels)
+    desired = labels_bool[src_idx].clone()                             # (B, A)
+    rows = torch.arange(desired.shape[0], device=desired.device).unsqueeze(1).expand_as(cond_attr)
+    desired[rows[active], cond_attr[active]] = want[active]
+
+    # Query satisfaction: target j must match row i's sign on every non-padded condition
+    tgt_labels = labels_bool[tgt_idx]                                  # (B, A)
+    at_queried = tgt_labels[:, cond_attr]                              # (B_tgt, B_row, T)
+    satisfied  = ((at_queried == want.unsqueeze(0)) | ~active.unsqueeze(0)).all(dim=-1).T
+
+    # Pairwise Hamming distance to the ideal target, XOR written as a float matmul
+    d, l = desired.float(), tgt_labels.float()
+    hamming = d @ (1.0 - l).T + (1.0 - d) @ l.T                        # (B_row, B_tgt)
+    return satisfied & (hamming <= HAMMING_BUDGET)
+
+
 def ca_infonce_loss(q: torch.Tensor, tgt_idx: torch.Tensor, hard_idx: torch.Tensor,
-                    embeddings: torch.Tensor, logit_scale: torch.Tensor) -> torch.Tensor:
+                    embeddings: torch.Tensor, logit_scale: torch.Tensor,
+                    valid_target_mask: torch.Tensor | None = None) -> torch.Tensor:
     """Compute the InfoNCE loss over in-batch targets plus one mined hard negative per row.
 
     Args:
@@ -2167,6 +2219,9 @@ def ca_infonce_loss(q: torch.Tensor, tgt_idx: torch.Tensor, hard_idx: torch.Tens
         hard_idx: (B,) mined hard-negative indices per row; negative marks "none".
         embeddings: (N, D) L2-normalized embedding bank the indices refer to.
         logit_scale: Scalar temperature multiplier (frozen CLIP logit scale).
+        valid_target_mask: Optional (B, B) mask from in_batch_valid_target_mask; True
+            off-diagonal entries are false negatives, excluded from the denominator
+            (each row's own positive on the diagonal always stays).
 
     Returns:
         The scalar InfoNCE loss.
@@ -2177,6 +2232,10 @@ def ca_infonce_loss(q: torch.Tensor, tgt_idx: torch.Tensor, hard_idx: torch.Tens
     hard_sim = (q * hf).sum(-1, keepdim=True)             # (B, 1) per-row hard-negative score
     logits = logit_scale * torch.cat([q @ t.T, hard_sim], dim=1)   # (B, B+1)
     logits[:, -1] = logits[:, -1].masked_fill(no_hard, -1e9)
+    if valid_target_mask is not None:
+        false_neg = valid_target_mask.clone()
+        false_neg.fill_diagonal_(False)
+        logits[:, :-1] = logits[:, :-1].masked_fill(false_neg, -1e9)
     labels_ce = torch.arange(q.shape[0], device=q.device)
     return F.cross_entropy(logits, labels_ce)
 
@@ -2198,8 +2257,10 @@ def ca_val_loss() -> float:
     for start in range(0, n_val, CA_BATCH):
         sl = slice(start, min(start + CA_BATCH, n_val))
         q = ca_model(train_embeddings[ca_val_src_dev[sl]], train_patches_for(ca_val_src_dev[sl]), ca_val_attr_dev[sl], ca_val_sign_dev[sl])
+        vt_mask = in_batch_valid_target_mask(ca_val_src_dev[sl], ca_val_tgt_dev[sl],
+                                             ca_val_attr_dev[sl], ca_val_sign_dev[sl], train_labels_bool)
         loss_sum += float(ca_infonce_loss(q, ca_val_tgt_dev[sl], ca_val_hard_dev[sl],
-                                          train_embeddings, logit_scale_value)) * q.shape[0]
+                                          train_embeddings, logit_scale_value, vt_mask)) * q.shape[0]
     return loss_sum / n_val
 
 
@@ -2288,8 +2349,10 @@ else:
         for start in range(0, n_train_trip, CA_BATCH):
             idx = perm[start:start + CA_BATCH]
             q = ca_model(train_embeddings[ca_trip_src_dev[idx]], train_patches_for(ca_trip_src_dev[idx]), ca_trip_attr_dev[idx], ca_trip_sign_dev[idx])
+            vt_mask = in_batch_valid_target_mask(ca_trip_src_dev[idx], ca_trip_tgt_dev[idx],
+                                                 ca_trip_attr_dev[idx], ca_trip_sign_dev[idx], train_labels_bool)
             loss = ca_infonce_loss(q, ca_trip_tgt_dev[idx], ca_trip_hard_dev[idx],
-                                   train_embeddings, logit_scale_value)
+                                   train_embeddings, logit_scale_value, vt_mask)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()

@@ -218,7 +218,7 @@ The modulation is zero-initialized, so training starts from the raw CLIP vector 
 
 $$\mathbf{q}=\Phi_\theta\big(\mathbf{v}_{\text{ref}},\{(a_k,s_k)\}\big)=\frac{\mathbf{v}_{\text{ref}}+\mathbf{g}\odot\boldsymbol{\delta}}{\lVert\mathbf{v}_{\text{ref}}+\mathbf{g}\odot\boldsymbol{\delta}\rVert_2}$$
 
-Once trained, the gate localizes edits to specific coordinates while leaving the rest of the reference intact, producing a unit-norm query $\mathbf{q}$ that reduces retrieval to a dot product.
+Both heads are initialized so the untrained module is exactly the identity map ($\mathbf{q}=\mathbf{v}_{\text{ref}}$): the edit head's final layer starts at zero while the gate starts open, letting gradient reach the edit head from the first step. Once trained, the gate localizes edits to specific coordinates while leaving the rest of the reference intact, producing a unit-norm query $\mathbf{q}$ that reduces retrieval to a dot product.
 
 ![Detailed layer-by-layer architecture of the cross-attention fusion module](figures/architecture_details.svg)
 
@@ -236,10 +236,10 @@ The module $\Phi_\theta$ is trained on top of frozen CLIP with label-free triple
 
 **InfoNCE objective** [(van den Oord et al., 2018)](https://arxiv.org/abs/1807.03748): To optimize the model, we employ the InfoNCE loss over a batch of $B$ triplets:
 
-$$\mathcal{L}=-\frac{1}{B}\sum_{i=1}^{B}\log\frac{\exp(\tau\,\mathbf{q}_i^{\top}\mathbf{p}_i)}{\displaystyle\sum_{j=1}^{B}\exp(\tau\,\mathbf{q}_i^{\top}\mathbf{p}_j)\;+\;\mathbb{1}[h_i\ \text{exists}]\,\exp(\tau\,\mathbf{q}_i^{\top}\mathbf{h}_i)}$$
+$$\mathcal{L}=-\frac{1}{B}\sum_{i=1}^{B}\log\frac{\exp(\tau\,\mathbf{q}_i^{\top}\mathbf{p}_i)}{\displaystyle\sum_{j\in\mathcal{N}_i}\exp(\tau\,\mathbf{q}_i^{\top}\mathbf{p}_j)\;+\;\mathbb{1}[h_i\ \text{exists}]\,\exp(\tau\,\mathbf{q}_i^{\top}\mathbf{h}_i)}$$
 
-Here, the fused query $\mathbf{q}_i$ is evaluated against its positive target $\mathbf{p}_i$, $B-1$ in-batch negative targets $\mathbf{p}_j$, and an optional hard negative $\mathbf{h}_i$ modulated by the indicator function $\mathbb{1}$. The frozen parameter $\tau$ scales the dot products according to CLIP's temperature.
-Minimizing $\mathcal{L}$ maximizes the similarity between the query and its true target while minimizing it against the in-batch and hard negatives.
+Here, the fused query $\mathbf{q}_i$ is evaluated against its positive target $\mathbf{p}_i$, the in-batch negative targets $\mathbf{p}_j$, and an optional hard negative $\mathbf{h}_i$ modulated by the indicator function $\mathbb{1}$. The frozen parameter $\tau$ scales the dot products according to CLIP's temperature. The denominator set $\mathcal{N}_i$ keeps row $i$'s own positive but drops **false negatives**: in-batch targets that would themselves be valid targets for row $i$'s query under the benchmark rule. CelebA faces are Hamming-close, so with a large batch such collisions are routine, and an unmasked loss would push the query away from images the benchmark counts as correct.
+Minimizing $\mathcal{L}$ maximizes the similarity between the query and its true target while minimizing it against the surviving in-batch negatives and the hard negative.
 
 **Optimization:** We optimize with **AdamW**: its per-parameter adaptive step sizes accommodate the diverse gradient scales of our heterogeneous modules, and decoupled weight decay provides regularization. The learning rate follows a **cosine-annealed schedule**, decaying smoothly to zero for stable convergence. A large batch size enriches the InfoNCE objective with more in-batch negatives. To prevent overfitting on the synthetic triplets, we combine weight decay with dropout in the decoder and fusion heads.
 
