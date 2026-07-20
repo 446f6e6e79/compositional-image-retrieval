@@ -267,6 +267,24 @@ For each evaluated pair, we extract two primary metrics:
 
 All analysis is performed directly using the frozen, trained weights without any additional training.
 
+### Ablation
+
+Cross-Attention Fusion stacks four components, and the aggregate comparison cannot say which of them earns the gain over the training-free methods. We therefore remove one component at a time and retrain from scratch, holding everything else fixed: the same cached triplet pool, the same initialization seed, the same optimizer, schedule, and epoch budget. The only difference between two rows of the table is the component itself.
+
+| Variant | Replacement | Component under test |
+| :--- | :--- | :--- |
+| **Full model** | - | - |
+| − Sign-aware FiLM | $\mathbf{c}_k = s_k \mathbf{t}_{a_k}$ (arithmetic negation) | Are learned signed directions better than a geometric mirror? |
+| − Patch grounding | Conditions never read the visual tokens | Does localizing an edit on the source face help? |
+| − Stacked cross-attention | Unweighted masked mean over the conditions | Does per-image weighting beat static fusion? |
+| − Residual gate | Gate fixed to $\mathbf{1}$, leaving a plain residual | Does per-dimension gating localize the edit? |
+
+Every variant is reported with three quantities: mean Recall@10 on the benchmark, the held-out validation InfoNCE loss, and an exact McNemar test against the full model on paired per-(query, source) outcomes. The benchmark is small enough that a raw Recall@10 gap is easy to over-read, so the paired test is what decides whether a component genuinely contributes.
+
+The **− stacked cross-attention** row is the most informative of the four. Replacing the attention pool with an unweighted mean is precisely the static, query-agnostic fusion that CLAY performs and that this project set out to improve on, so that row measures the central claim directly rather than by analogy.
+
+Two variants are near parameter-matched with the full model (removing FiLM costs 0.5M of 9.6M parameters, removing the gate 0.5M), but removing patch grounding costs 3.5M and removing cross-attention 4.2M. Those two deltas therefore confound the mechanism with raw capacity, and a drop in either row is an upper bound on the component's contribution rather than a clean measurement of it. All variants are exactly the identity map at initialization, so none of them starts from an advantaged position.
+
 ### Limitations
 
 While our method shows clear progress, several architectural and semantic limitations remain:

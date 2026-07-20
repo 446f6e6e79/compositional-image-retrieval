@@ -1018,6 +1018,9 @@ plot_images(celeba, indices=ground_truth_indices, n_cols=5, n_rows=1, figsize=(1
 # Cell  48 [code] - def retrieve_topk(scores: torch.Tensor, exclude_idx: int, k: int = 10) -> lis…
 #==============================================================================
 
+from scipy.stats import binomtest
+
+
 def retrieve_topk(scores: torch.Tensor, exclude_idx: int, k: int = 10) -> list[int]:
     """Return the top-k gallery indices by score, excluding the source image.
 
@@ -1135,6 +1138,45 @@ def evaluate_and_average(annotations: list[dict], make_scorer: Callable, verbose
     """
     results = evaluate(annotations, make_scorer, verbose=verbose)
     return results, [compute_query_average_results(q) for q in results]
+
+
+def recall10_hits(evaluation_results: list[dict]) -> np.ndarray:
+    """Flatten a method's per-(query, source) Recall@10 outcomes into one aligned 0/1 vector.
+
+    evaluate() iterates annotations and sources in a fixed order, so vectors extracted this
+    way are paired across methods: position i is the same (query, source) for every method.
+
+    Args:
+        evaluation_results: Raw per-source metrics, as returned by evaluate().
+
+    Returns:
+        A 1D 0/1 int array, one entry per (query, source) pair.
+    """
+    return np.array([
+        metrics["Recall@10"]
+        for query_results in evaluation_results
+        for metrics in query_results.values()
+    ], dtype=int)
+
+
+def mcnemar_pvalue(hits_a: np.ndarray, hits_b: np.ndarray) -> tuple[float, int, int]:
+    """Exact McNemar test on paired binary outcomes.
+
+    Only discordant pairs carry information: b counts sources where A hits and B misses,
+    c the reverse. Under H0 (no difference) each discordant pair is a fair coin, so the
+    p-value is an exact two-sided binomial test.
+
+    Args:
+        hits_a: 0/1 outcome vector of method A.
+        hits_b: 0/1 outcome vector of method B, paired with `hits_a`.
+
+    Returns:
+        A (p_value, b, c) tuple; p_value is 1.0 when there are no discordant pairs.
+    """
+    b = int(((hits_a == 1) & (hits_b == 0)).sum())
+    c = int(((hits_a == 0) & (hits_b == 1)).sum())
+    p = 1.0 if b + c == 0 else binomtest(min(b, c), b + c, 0.5).pvalue
+    return p, b, c
 
 
 #==============================================================================
@@ -1742,6 +1784,17 @@ CA_WD             = 1e-2       # AdamW weight decay
 
 CA_FILM_SIGN_STD  = 0.02       # FiLM sign-embedding init std
 CA_GATE_BIAS_INIT = 2.0        # gated-residual gate-open bias; sigmoid(2.0)≈0.88 keeps gate open
+CA_SEED           = 0          # init seed, re-applied before every build so the full model and
+                               # the ablation variants below differ only in architecture
+
+# Ablation variants: each disables exactly one component of the fusion module. Consumed by the
+# ablation study cells further down; the full model passes no flags at all
+ABLATION_VARIANTS = {
+    "− sign-aware FiLM":   {"use_film":   False},
+    "− patch grounding":   {"use_ground": False},
+    "− cross-attention":   {"use_attn":   False},
+    "− residual gate":     {"use_gate":   False},
+}
 
 
 #==============================================================================
@@ -1839,7 +1892,9 @@ class CrossAttentionFusion(nn.Module):
     def __init__(self, attr_name_embs: torch.Tensor, dim: int, n_heads: int = 4,
                  n_layers: int = 2, ffn_mult: int = 2, dropout: float = 0.1,
                  film_sign_std: float = 0.02, gate_bias_init: float = 2.0,
-                 clip_dim: int = 768, ground_layers: int = 1, ground_heads: int = 4):
+                 clip_dim: int = 768, ground_layers: int = 1, ground_heads: int = 4,
+                 *, use_film: bool = True, use_ground: bool = True,
+                 use_attn: bool = True, use_gate: bool = True):
         """Build the cross-attention fusion module.
 
         Args:
@@ -1854,52 +1909,71 @@ class CrossAttentionFusion(nn.Module):
             clip_dim: Hidden width of CLIP's raw visual tokens (768 for ViT-B/32).
             ground_layers: Number of patch-grounding Transformer-decoder layers.
             ground_heads: Number of attention heads in the grounding decoder.
+            use_film: Keep sign-aware FiLM. When False, conditions are the frozen attribute
+                vectors multiplied by their raw sign (plain arithmetic negation).
+            use_ground: Keep patch grounding. When False, conditions never read the visual tokens.
+            use_attn: Keep the stacked cross-attention. When False, the conditions are pooled by
+                an unweighted masked mean, i.e. the static query-agnostic fusion this project
+                argues against.
+            use_gate: Keep the per-dimension residual gate. When False the gate is fixed to 1,
+                leaving a plain residual (the zero-init identity property is preserved either way).
+
+        The four ``use_*`` flags exist for the ablation study; all default to True, so the full
+        model is the plain constructor call.
         """
         super().__init__()
+        self.use_film, self.use_ground = use_film, use_ground
+        self.use_attn, self.use_gate = use_attn, use_gate
 
         # Frozen cleaned attribute-name CLIP text bank, indexed per condition in forward()
         self.register_buffer("attr_name", attr_name_embs)  # (n_attrs, D)
 
-        # Sign embedding: each sign (+/-) gets a learned vector for FiLM modulation
-        self.sign_embed = nn.Embedding(2, dim)              # weight: (2, D)   [0: +, 1: -]
-        nn.init.normal_(self.sign_embed.weight, std=film_sign_std)
+        if use_film:
+            # Sign embedding: each sign (+/-) gets a learned vector for FiLM modulation
+            self.sign_embed = nn.Embedding(2, dim)              # weight: (2, D)   [0: +, 1: -]
+            nn.init.normal_(self.sign_embed.weight, std=film_sign_std)
 
-        # Sign-conditioned FiLM: maps a sign embedding (D) to a per-dim scale + shift (2D),
-        # letting "+" and "-" modulate the same frozen attribute vector in opposite, learned ways
-        self.film = nn.Linear(dim, 2 * dim)                 # (B, T, D) -> (B, T, 2D)
-        nn.init.zeros_(self.film.weight)    # gamma
-        nn.init.zeros_(self.film.bias)      # beta
+            # Sign-conditioned FiLM: maps a sign embedding (D) to a per-dim scale + shift (2D),
+            # letting "+" and "-" modulate the same frozen attribute vector in opposite, learned ways
+            self.film = nn.Linear(dim, 2 * dim)                 # (B, T, D) -> (B, T, 2D)
+            nn.init.zeros_(self.film.weight)    # gamma
+            nn.init.zeros_(self.film.bias)      # beta
 
-        # Patch grounding: project frozen CLIP visual tokens back into the fusion dimension
-        self.vis_proj = nn.Linear(clip_dim, dim)             # (B, 50, clip_dim) -> (B, 50, D)
-        self.vis_type = nn.Embedding(2, dim)                 # weight: (2, D)   [0: CLS, 1: patch]
-        nn.init.normal_(self.vis_type.weight, std=film_sign_std)   # same small init std as the sign table
-        ground_layer = nn.TransformerDecoderLayer(
-            dim, ground_heads, dim_feedforward=ffn_mult * dim, dropout=dropout,
-            activation="gelu", batch_first=True, norm_first=True,
-        )
-        self.ground = nn.TransformerDecoder(ground_layer, num_layers=ground_layers)
-        # tgt: (B, T, D) conditions, memory: (B, 50, D) grounded visual tokens -> (B, T, D)
+        if use_ground:
+            # Patch grounding: project frozen CLIP visual tokens back into the fusion dimension
+            self.vis_proj = nn.Linear(clip_dim, dim)             # (B, 50, clip_dim) -> (B, 50, D)
+            self.vis_type = nn.Embedding(2, dim)                 # weight: (2, D)   [0: CLS, 1: patch]
+            nn.init.normal_(self.vis_type.weight, std=film_sign_std)   # same small init std as the sign table
+            ground_layer = nn.TransformerDecoderLayer(
+                dim, ground_heads, dim_feedforward=ffn_mult * dim, dropout=dropout,
+                activation="gelu", batch_first=True, norm_first=True,
+            )
+            self.ground = nn.TransformerDecoder(ground_layer, num_layers=ground_layers)
+            # tgt: (B, T, D) conditions, memory: (B, 50, D) grounded visual tokens -> (B, T, D)
 
-        # Stacked cross-attention: image (1 query token) attends over the grounded conditions
-        self.decoder = CrossAttnPoolDecoder(dim, n_heads, n_layers, ffn_mult * dim, dropout)
-        # tgt: (B, 1, D) image query, memory: (B, T, D) conditions -> (B, 1, D)
+        if use_attn:
+            # Stacked cross-attention: image (1 query token) attends over the grounded conditions
+            self.decoder = CrossAttnPoolDecoder(dim, n_heads, n_layers, ffn_mult * dim, dropout)
+            # tgt: (B, 1, D) image query, memory: (B, T, D) conditions -> (B, 1, D)
 
         # Gated residual head: a sigmoid gate weighs a non-linear delta added back onto v_ref
         self.delta = nn.Sequential(
             nn.Linear(2 * dim, dim), nn.GELU(), nn.Dropout(dropout), nn.Linear(dim, dim),
         )                                                   # (B, 2D) -> (B, D)
-        self.gate = nn.Sequential(nn.Linear(2 * dim, dim), nn.Sigmoid())
+        if use_gate:
+            self.gate = nn.Sequential(nn.Linear(2 * dim, dim), nn.Sigmoid())
                                                                 # (B, 2D) -> (B, D), in (0, 1)
 
         # Zero-init the delta head's last layer so the module is exactly the identity map at
         # step 0 (out = v_ref, matching the FiLM identity init); its weights still receive
-        # gradient because their inputs are non-zero
+        # gradient because their inputs are non-zero. This holds for every ablation variant:
+        # a zero delta is the identity whether or not it is gated
         nn.init.zeros_(self.delta[-1].weight)
         nn.init.zeros_(self.delta[-1].bias)
 
-        # Gate starts open (sigmoid(2) ~ 0.88) so the delta head is not doubly suppressed at init
-        nn.init.constant_(self.gate[0].bias, gate_bias_init)
+        if use_gate:
+            # Gate starts open (sigmoid(2) ~ 0.88) so the delta head is not doubly suppressed at init
+            nn.init.constant_(self.gate[0].bias, gate_bias_init)
 
     def forward(self, img_emb: torch.Tensor, vis_tokens: torch.Tensor,
                 cond_attr: torch.Tensor, cond_sign: torch.Tensor) -> torch.Tensor:
@@ -1923,39 +1997,70 @@ class CrossAttentionFusion(nn.Module):
         # single Linear(D, 2D) whose output is split into a per-dimension scale (gamma) and
         # shift (beta). This lets "+" and "-" modulate the same frozen attribute text vector
         # in opposite, learned ways instead of just negating it.
-        sign_emb    = self.sign_embed(sign_id)                    # (B, T, D)
-        gamma, beta = self.film(sign_emb).chunk(2, dim=-1)        # (B, T, D) each
-        conds       = (1.0 + gamma) * attr + beta                 # (B, T, D)
+        if self.use_film:
+            sign_emb    = self.sign_embed(sign_id)                    # (B, T, D)
+            gamma, beta = self.film(sign_emb).chunk(2, dim=-1)        # (B, T, D) each
+            conds       = (1.0 + gamma) * attr + beta                 # (B, T, D)
+        else:
+            # Ablation: plain arithmetic negation, the geometric mirror point FiLM replaces
+            conds = cond_sign.unsqueeze(-1).to(attr.dtype) * attr     # (B, T, D)
 
         # 2. Patch grounding: project the source's visual tokens, tag CLS vs patch, and let the
         # conditions self-attend (co-adapt, tempering contradictory edits) and cross-attend
         # (ground spatially) over them.
-        V = self.vis_proj(vis_tokens.to(self.vis_proj.weight.dtype))         # (B, 50, D)
-        type_id = torch.ones(V.shape[1], dtype=torch.long, device=V.device)  # (50,)
-        type_id[0] = 0                                                       # position 0 is the CLS token
-        V = V + self.vis_type(type_id)                                       # (B, 50, D), broadcast over batch
-        conds = self.ground(conds, V, tgt_key_padding_mask=pad_mask)         # (B, T, D) grounded
+        if self.use_ground:
+            V = self.vis_proj(vis_tokens.to(self.vis_proj.weight.dtype))         # (B, 50, D)
+            type_id = torch.ones(V.shape[1], dtype=torch.long, device=V.device)  # (50,)
+            type_id[0] = 0                                                       # position 0 is the CLS token
+            V = V + self.vis_type(type_id)                                       # (B, 50, D), broadcast over batch
+            conds = self.ground(conds, V, tgt_key_padding_mask=pad_mask)         # (B, T, D) grounded
 
         # 3. Stacked cross-attention: the image (1 query token) reads the grounded conditions
-        q        = img_emb.unsqueeze(1)                                      # (B, 1, D)
-        attended = self.decoder(q, conds, memory_key_padding_mask=pad_mask)  # (B, 1, D)
-        attended = attended.squeeze(1)                                       # (B, D)
+        if self.use_attn:
+            q        = img_emb.unsqueeze(1)                                      # (B, 1, D)
+            attended = self.decoder(q, conds, memory_key_padding_mask=pad_mask)  # (B, 1, D)
+            attended = attended.squeeze(1)                                       # (B, D)
+        else:
+            # Ablation: unweighted masked mean. Every condition gets the same weight and the
+            # image has no say in the pooling, which is exactly the static fusion of CLAY
+            keep    = (~pad_mask).unsqueeze(-1).to(conds.dtype)                  # (B, T, 1)
+            n_keep  = keep.sum(dim=1).clamp(min=1.0)                             # (B, 1)
+            attended = (conds * keep).sum(dim=1) / n_keep                        # (B, D)
 
         # 4. Gated-residual fusion: v_ref preserved by default, delta can add or subtract
         fused = torch.cat([img_emb, attended], dim=-1)   # (B, 2D)
-        gate  = self.gate(fused)                         # (B, D), in (0, 1)
         delta = self.delta(fused)                        # (B, D)
+        # Ablation (use_gate=False): gate fixed to 1, leaving a plain residual
+        gate  = self.gate(fused) if self.use_gate else 1.0
         out   = img_emb + gate * delta                   # (B, D)
         return F.normalize(out, dim=-1)                  # (B, D), L2-normalized
 
 
+def build_ca_model(**flags) -> CrossAttentionFusion:
+    """Build a cross-attention fusion model from the module-level hyperparameters.
+
+    Reseeds immediately before construction so the full model and every ablation variant start
+    from the same initialisation draw and differ only in the component being ablated.
+
+    Args:
+        **flags: Optional ``use_film`` / ``use_ground`` / ``use_attn`` / ``use_gate`` overrides.
+            Passing none builds the full model.
+
+    Returns:
+        The constructed module, moved onto `device`.
+    """
+    torch.manual_seed(CA_SEED)
+    return CrossAttentionFusion(
+        get_attribute_name_embeddings(device), gallery_embeddings.shape[1],
+        n_heads=CA_HEADS, n_layers=CA_LAYERS, ffn_mult=CA_FFN_MULT, dropout=CA_DROPOUT,
+        film_sign_std=CA_FILM_SIGN_STD, gate_bias_init=CA_GATE_BIAS_INIT,
+        clip_dim=CLIP_VIS_DIM, ground_layers=CA_GROUND_LAYERS, ground_heads=CA_GROUND_HEADS,
+        **flags,
+    ).to(device)
+
+
 # Instantiate the cross-attention fusion model
-ca_model = CrossAttentionFusion(
-    get_attribute_name_embeddings(device), gallery_embeddings.shape[1],
-    n_heads=CA_HEADS, n_layers=CA_LAYERS, ffn_mult=CA_FFN_MULT, dropout=CA_DROPOUT,
-    film_sign_std=CA_FILM_SIGN_STD, gate_bias_init=CA_GATE_BIAS_INIT,
-    clip_dim=CLIP_VIS_DIM, ground_layers=CA_GROUND_LAYERS, ground_heads=CA_GROUND_HEADS,
-).to(device)
+ca_model = build_ca_model()
 
 
 #==============================================================================
@@ -1965,22 +2070,30 @@ ca_model = CrossAttentionFusion(
 n_params = sum(p.numel() for p in ca_model.parameters() if p.requires_grad)
 print(f"Cross-Attention trainable parameters: {n_params:,}")
 
-# Forward self-check: shapes and unit-norm output (cheap correctness gate)
-ca_model.eval()
-with torch.no_grad():
-    _b    = 4
-    _img  = F.normalize(torch.randn(_b, gallery_embeddings.shape[1], device=device), dim=-1)
-    _vis  = torch.randn(_b, 50, CLIP_VIS_DIM, device=device)
-    _attr = torch.randint(0, len(get_attributes()), (_b, 3), device=device)
-    _sign = torch.tensor([[1, -1, 0], [1, 0, 0], [-1, -1, 1], [1, 1, -1]], device=device)
-    _out  = ca_model(_img, _vis, _attr, _sign)
+# Forward self-check: shapes and unit-norm output (cheap correctness gate). Run over the full
+# model and every ablation variant, so a variant that silently breaks the contract (wrong shape,
+# un-normalized output, or a broken identity init that would hand it a different starting point
+# from the full model) is caught here rather than showing up as a bogus ablation number
+_b    = 4
+_img  = F.normalize(torch.randn(_b, gallery_embeddings.shape[1], device=device), dim=-1)
+_vis  = torch.randn(_b, 50, CLIP_VIS_DIM, device=device)
+_attr = torch.randint(0, len(get_attributes()), (_b, 3), device=device)
+_sign = torch.tensor([[1, -1, 0], [1, 0, 0], [-1, -1, 1], [1, 1, -1]], device=device)
 
-    assert _out.shape == (_b, gallery_embeddings.shape[1]), _out.shape
-    assert torch.allclose(_out.norm(dim=-1), torch.ones(_b, device=device), atol=1e-5)
+for _name, _flags in [("full model", {}), *ABLATION_VARIANTS.items()]:
+    _m = ca_model if not _flags else build_ca_model(**_flags)
+    _m.eval()
+    with torch.no_grad():
+        _out = _m(_img, _vis, _attr, _sign)
+
+    assert _out.shape == (_b, gallery_embeddings.shape[1]), (_name, _out.shape)
+    assert torch.allclose(_out.norm(dim=-1), torch.ones(_b, device=device), atol=1e-5), _name
     # Zero-init delta head -> the untrained module must be exactly the identity map
-    assert torch.allclose(_out, _img, atol=1e-5)
+    assert torch.allclose(_out, _img, atol=1e-5), _name
 
-print("Forward self-check passed:", tuple(_out.shape))
+    _n = sum(p.numel() for p in _m.parameters() if p.requires_grad)
+    print(f"Forward self-check passed: {_name:<20} {_n:>10,} params")
+
 ca_model.train()
 
 
@@ -2253,23 +2366,27 @@ def ca_infonce_loss(q: torch.Tensor, tgt_idx: torch.Tensor, hard_idx: torch.Tens
 
 
 @torch.no_grad()
-def ca_val_loss() -> float:
+def ca_val_loss(model: nn.Module) -> float:
     """Mean validation InfoNCE loss over the held-out triplets.
 
     Reuses the training objective (in-batch plus mined hard negatives, via ca_infonce_loss)
     so the train and validation loss curves are directly comparable. This is the metric used
-    for checkpoint selection.
+    for checkpoint selection, and it is comparable across the ablation variants because they
+    all share the same cached validation triplets.
+
+    Args:
+        model: The fusion module to score.
 
     Returns:
         The mean validation loss.
     """
-    ca_model.eval()
+    model.eval()
     loss_sum = 0.0
     n_val = ca_val_src_dev.shape[0]
     for start in range(0, n_val, CA_BATCH):
         sl = slice(start, min(start + CA_BATCH, n_val))
-        q = ca_model(train_embeddings[ca_val_src_dev[sl]], train_patches_for(ca_val_src_dev[sl]),
-                     ca_val_attr_dev[sl], ca_val_sign_dev[sl])
+        q = model(train_embeddings[ca_val_src_dev[sl]], train_patches_for(ca_val_src_dev[sl]),
+                  ca_val_attr_dev[sl], ca_val_sign_dev[sl])
         vt_mask = in_batch_valid_target_mask(ca_val_src_dev[sl], ca_val_tgt_dev[sl],
                                              ca_val_attr_dev[sl], ca_val_sign_dev[sl], train_labels_bool)
         loss_sum += float(ca_infonce_loss(q, ca_val_tgt_dev[sl], ca_val_hard_dev[sl],
@@ -2317,20 +2434,49 @@ def plot_training_curve(history: dict, title: str = "Cross-Attention Training Cu
 #==============================================================================
 
 CA_CKPT = EVALUATION_CACHE_DIR / "cross_attn_patch.pt"
-_ca_cached = torch.load(CA_CKPT, map_location=device) if CA_CKPT.exists() else None
 
-if _ca_cached is not None:
-    ca_model.load_state_dict(_ca_cached["state_dict"])
-    ca_model.eval()
-    print(f"Loaded cached cross-attention from {CA_CKPT} (val loss={_ca_cached.get('val_loss', float('nan')):.4f}) — skipping training.")
-    if _ca_cached.get("history") is not None:
-        plot_training_curve(_ca_cached["history"])
-    else:
-        print("Cached checkpoint predates training history — re-train to regenerate the learning curve.")
-else:
+
+def train_cross_attention(model: nn.Module, ckpt_path: Path, *, epochs: int = CA_EPOCHS,
+                          plot: bool = True, label: str = "cross-attention") -> dict:
+    """Train a fusion module with InfoNCE, or load it from cache if the checkpoint exists.
+
+    Selects the minimum-validation-loss weights, writing the checkpoint on every improvement so
+    an interrupted Colab run loses at most the epochs since the last improvement. Taking the
+    module and checkpoint path as arguments lets the ablation variants below reuse this exact
+    training procedure, which is what makes their scores comparable to the full model's.
+
+    Args:
+        model: The fusion module to train, modified in place; ends holding the best weights.
+        ckpt_path: Where to read/write the checkpoint. An existing file short-circuits training.
+        epochs: Number of training epochs.
+        plot: Whether to draw the learning curve (off for the ablation runs, which would
+            otherwise emit one figure per variant).
+        label: Name used in progress messages.
+
+    Returns:
+        The training history dict, with an added "val_loss_best" key.
+    """
+    cached = torch.load(ckpt_path, map_location=device) if ckpt_path.exists() else None
+    if cached is not None:
+        model.load_state_dict(cached["state_dict"])
+        model.eval()
+        print(f"Loaded cached {label} from {ckpt_path} "
+              f"(val loss={cached.get('val_loss', float('nan')):.4f}) — skipping training.")
+        history = cached.get("history")
+        if history is None:
+            print("Cached checkpoint predates training history — re-train to regenerate the learning curve.")
+            return {"val_loss_best": cached.get("val_loss", float("nan"))}
+        if plot:
+            plot_training_curve(history)
+        return {**history, "val_loss_best": cached.get("val_loss", float("nan"))}
+
+    # Reseed so every variant sees the same batch order and dropout draws as the full model:
+    # without this the ablation deltas would carry run-to-run noise on top of the component effect
+    torch.manual_seed(CA_SEED)
+
     # Optimizer / LR schedule.
-    optimizer = torch.optim.AdamW(ca_model.parameters(), lr=CA_LR, weight_decay=CA_WD)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=CA_EPOCHS)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=CA_LR, weight_decay=CA_WD)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     best_val_loss, best_ca_state, best_epoch = float("inf"), None, -1
     n_train_trip = ca_trip_src_dev.shape[0]
 
@@ -2339,30 +2485,25 @@ else:
     step = 0
 
     def _save_ca_checkpoint():
-        """Persist the current best checkpoint to CA_CKPT.
-
-        Called on every validation improvement (not just once at the end) so a Colab
-        crash mid-training loses at most the epochs since the last improvement, not
-        the whole run.
-        """
+        """Persist the current best checkpoint to `ckpt_path`."""
         torch.save(
             {"state_dict": {k: v.cpu() for k, v in best_ca_state.items()},
              "val_loss": best_val_loss, "history": history},
-            CA_CKPT,
+            ckpt_path,
         )
 
     # Baseline validation loss at step 0 (untrained model): plotted, but not a checkpoint candidate.
     history["epoch_step"].append(0)
-    history["val_loss"].append(ca_val_loss())
+    history["val_loss"].append(ca_val_loss(model))
 
     # Training loop: InfoNCE on the fused query vs target, keeping the min-val-loss weights.
-    for epoch in range(CA_EPOCHS):
-        ca_model.train()
+    for epoch in range(epochs):
+        model.train()
         perm = torch.randperm(n_train_trip, device=device)
         for start in range(0, n_train_trip, CA_BATCH):
             idx = perm[start:start + CA_BATCH]
-            q = ca_model(train_embeddings[ca_trip_src_dev[idx]], train_patches_for(ca_trip_src_dev[idx]),
-                         ca_trip_attr_dev[idx], ca_trip_sign_dev[idx])
+            q = model(train_embeddings[ca_trip_src_dev[idx]], train_patches_for(ca_trip_src_dev[idx]),
+                      ca_trip_attr_dev[idx], ca_trip_sign_dev[idx])
             vt_mask = in_batch_valid_target_mask(ca_trip_src_dev[idx], ca_trip_tgt_dev[idx],
                                                  ca_trip_attr_dev[idx], ca_trip_sign_dev[idx], train_labels_bool)
             loss = ca_infonce_loss(q, ca_trip_tgt_dev[idx], ca_trip_hard_dev[idx],
@@ -2376,28 +2517,34 @@ else:
         scheduler.step()
 
         # Per-epoch validation loss and best-checkpoint tracking (minimum val loss).
-        val_loss = ca_val_loss()
+        val_loss = ca_val_loss(model)
         history["epoch_step"].append(step)
         history["val_loss"].append(val_loss)
         if val_loss < best_val_loss:
             best_val_loss, best_epoch = val_loss, len(history["val_loss"]) - 1
-            best_ca_state = {k: v.detach().clone() for k, v in ca_model.state_dict().items()}
+            best_ca_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
             _save_ca_checkpoint()
         history["best_epoch"] = best_epoch
 
         # Live, in-place redraw of the learning curve so training state is visible as it runs.
-        clear_output(wait=True)
-        plot_training_curve(history)
-        print(f"Epoch {epoch+1:3d}/{CA_EPOCHS}  train loss={history['loss'][-1]:.4f}  "
+        if plot:
+            clear_output(wait=True)
+            plot_training_curve(history)
+        print(f"[{label}] epoch {epoch+1:3d}/{epochs}  train loss={history['loss'][-1]:.4f}  "
               f"val loss={val_loss:.4f}  (best epoch {best_epoch})")
 
     # Restore best weights, draw the final figure, and cache weights + history.
-    ca_model.load_state_dict(best_ca_state)
-    clear_output(wait=True)
-    plot_training_curve(history)
+    model.load_state_dict(best_ca_state)
+    if plot:
+        clear_output(wait=True)
+        plot_training_curve(history)
     print(f"Best val loss: {best_val_loss:.4f} (epoch {best_epoch})")
     _save_ca_checkpoint()  # final history (post-loop) may differ from the last improvement's save
-    print(f"Saved cross-attention to {CA_CKPT}")
+    print(f"Saved {label} to {ckpt_path}")
+    return {**history, "val_loss_best": best_val_loss}
+
+
+ca_history = train_cross_attention(ca_model, CA_CKPT)
 
 
 #==============================================================================
@@ -2433,13 +2580,17 @@ def query_to_condition_rows(text_query: str) -> tuple[torch.Tensor, torch.Tensor
 
 
 @torch.no_grad()
-def fuse_source_query(source_idx: int, cond_attr: torch.Tensor, cond_sign: torch.Tensor) -> torch.Tensor:
-    """Run the trained fusion module on one (source image, query) pair.
+def fuse_source_query(model: nn.Module, source_idx: int,
+                      cond_attr: torch.Tensor, cond_sign: torch.Tensor) -> torch.Tensor:
+    """Run a trained fusion module on one (source image, query) pair.
 
     Shared by the evaluation scorer and the qualitative inspection (which additionally hooks the
     gate), so the fused-query computation for a single source is defined in exactly one place.
+    The module is passed in rather than read from the global so the ablation variants below can
+    be scored through this same path.
 
     Args:
+        model: Trained CrossAttentionFusion module to fuse with.
         source_idx: Gallery index of the source image; must be a benchmark source (see
             `gallery_patches_for`).
         cond_attr: (1, T) attribute indices for each condition.
@@ -2449,12 +2600,12 @@ def fuse_source_query(source_idx: int, cond_attr: torch.Tensor, cond_sign: torch
         A (D,) L2-normalized fused query embedding.
     """
     idx = torch.tensor([source_idx], device=gallery_embeddings.device)
-    return ca_model(
+    return model(
         gallery_embeddings[idx], gallery_patches_for(idx), cond_attr, cond_sign
     ).squeeze(0)
 
 
-def cross_attn_scorer(gallery_embeddings: torch.Tensor, ca_model: nn.Module) -> Callable:
+def cross_attn_scorer(gallery_embeddings: torch.Tensor, model: nn.Module) -> Callable:
     """Build the scorer factory for Cross-Attention Fusion.
 
     Builds the fused query embedding once per annotation and returns gallery
@@ -2462,12 +2613,13 @@ def cross_attn_scorer(gallery_embeddings: torch.Tensor, ca_model: nn.Module) -> 
 
     Args:
         gallery_embeddings: (N, D) gallery image embeddings, L2-normalized per row.
-        ca_model: Trained CrossAttentionFusion model.
+        model: Trained CrossAttentionFusion model. Also used for the ablation variants, which
+            are scored through this same factory.
 
     Returns:
         A ``make_scorer(annotation)`` factory consumed by evaluate().
     """
-    ca_model.eval()
+    model.eval()
 
     def make_scorer(annotation: dict) -> Callable:
         """Build a per-query scorer from the query's condition rows."""
@@ -2476,7 +2628,7 @@ def cross_attn_scorer(gallery_embeddings: torch.Tensor, ca_model: nn.Module) -> 
         @torch.no_grad()
         def scorer(source_idx: int) -> torch.Tensor:
             """Score every gallery image against the fused source query embedding."""
-            q = fuse_source_query(source_idx, cond_attr, cond_sign)
+            q = fuse_source_query(model, source_idx, cond_attr, cond_sign)
             return gallery_embeddings @ q
 
         return scorer
@@ -2526,7 +2678,7 @@ def fuse_and_gate(source_idx: int, text_query: str) -> tuple[torch.Tensor, np.nd
     handle = ca_model.gate.register_forward_hook(grab_gate)
     ca_model.eval()
     try:
-        q = fuse_source_query(source_idx, cond_attr, cond_sign)
+        q = fuse_source_query(ca_model, source_idx, cond_attr, cond_sign)
     finally:
         handle.remove()
     return q, captured["gate"][0].cpu().numpy()
@@ -2656,6 +2808,72 @@ for kind, ann in inspection_queries:
 
 
 #==============================================================================
+# Cell 106 [code] - Ablation study: train one variant per removed component
+#==============================================================================
+
+# Each variant disables exactly one component of the fusion module (see ABLATION_VARIANTS) and is
+# retrained from scratch on the same cached triplet pool, from the same init seed, with the same
+# optimizer and schedule as the full model. The only difference between two rows is therefore the
+# component itself. Checkpoints are cached per variant, so re-running this cell is free
+ablation_models, ablation_results, ablation_val_loss = {}, {}, {}
+
+for variant_name, flags in ABLATION_VARIANTS.items():
+    slug = "_".join(k.removeprefix("use_") for k in flags)      # e.g. "film" -> cross_attn_ablate_film.pt
+    print(f"\n===== Ablation: {variant_name} =====")
+
+    variant_model = build_ca_model(**flags)
+    variant_history = train_cross_attention(
+        variant_model, EVALUATION_CACHE_DIR / f"cross_attn_ablate_{slug}.pt",
+        plot=False, label=variant_name,
+    )
+
+    evaluation_results_v, average_results_per_query_v = evaluate_and_average(
+        annotations, cross_attn_scorer(gallery_embeddings, variant_model),
+    )
+    ablation_models[variant_name] = variant_model
+    ablation_results[variant_name] = (evaluation_results_v, average_results_per_query_v)
+    ablation_val_loss[variant_name] = variant_history["val_loss_best"]
+    print(f"{variant_name}: mean Recall@10 = {mean_recall_at_10(evaluation_results_v):.3f}")
+
+
+#==============================================================================
+# Cell 107 [code] - Ablation study: results table and significance vs the full model
+#==============================================================================
+
+# Retrieval table: the full model on top, each variant below it
+ablation_table = {"Cross-Attention (full)": average_results_per_query_ca}
+ablation_table.update({name: avg for name, (_, avg) in ablation_results.items()})
+
+plot_results_table(
+    ablation_table,
+    title="Ablation: mean Recall@K / Precision@K per removed component",
+)
+
+# Effect size and significance of each removal, measured against the full model. The benchmark is
+# small, so a raw Recall@10 gap is easy to over-read; the McNemar test on paired per-source
+# outcomes says whether a gap is larger than what resampling alone would produce
+full_hits = recall10_hits(evaluation_results_ca)
+full_val  = ca_history.get("val_loss_best", float("nan"))
+
+print(f"Ablation vs the full model ({len(full_hits)} paired (query, source) outcomes)\n")
+print(f"{'Removed component':<24} {'R@10':>6} {'ΔR@10':>7} {'val loss':>9} {'Δval':>7} "
+      f"{'full>abl':>9} {'abl>full':>9} {'p-value':>9}")
+print(f"{'(none: full model)':<24} {full_hits.mean():>6.3f} {'':>7} {full_val:>9.4f} "
+      f"{'':>7} {'':>9} {'':>9} {'':>9}")
+
+for variant_name, (evaluation_results_v, _) in ablation_results.items():
+    hits_v = recall10_hits(evaluation_results_v)
+    p, b, c = mcnemar_pvalue(full_hits, hits_v)
+    val_v = ablation_val_loss[variant_name]
+    print(f"{variant_name:<24} {hits_v.mean():>6.3f} {hits_v.mean() - full_hits.mean():>+7.3f} "
+          f"{val_v:>9.4f} {val_v - full_val:>+7.4f} {b:>9} {c:>9} {p:>9.2g}")
+
+print("\nΔ columns are variant minus full model: negative ΔR@10 and positive Δval loss both mean "
+      "\nthe removed component was contributing. Parameter counts differ for the grounding and "
+      "\ncross-attention rows, so those deltas mix mechanism with capacity.")
+
+
+#==============================================================================
 # Cell 108 [code] - Aggregate results across all methods
 #==============================================================================
 
@@ -2680,48 +2898,6 @@ plot_results_table(
 #==============================================================================
 # Cell 110 [code] - Paired significance tests (McNemar on per-source Recall@10)
 #==============================================================================
-
-from scipy.stats import binomtest
-
-
-def recall10_hits(evaluation_results: list[dict]) -> np.ndarray:
-    """Flatten a method's per-(query, source) Recall@10 outcomes into one aligned 0/1 vector.
-
-    evaluate() iterates annotations and sources in a fixed order, so vectors extracted this
-    way are paired across methods: position i is the same (query, source) for every method.
-
-    Args:
-        evaluation_results: Raw per-source metrics, as returned by evaluate().
-
-    Returns:
-        A 1D 0/1 int array, one entry per (query, source) pair.
-    """
-    return np.array([
-        metrics["Recall@10"]
-        for query_results in evaluation_results
-        for metrics in query_results.values()
-    ], dtype=int)
-
-
-def mcnemar_pvalue(hits_a: np.ndarray, hits_b: np.ndarray) -> tuple[float, int, int]:
-    """Exact McNemar test on paired binary outcomes.
-
-    Only discordant pairs carry information: b counts sources where A hits and B misses,
-    c the reverse. Under H0 (no difference) each discordant pair is a fair coin, so the
-    p-value is an exact two-sided binomial test.
-
-    Args:
-        hits_a: 0/1 outcome vector of method A.
-        hits_b: 0/1 outcome vector of method B, paired with `hits_a`.
-
-    Returns:
-        A (p_value, b, c) tuple; p_value is 1.0 when there are no discordant pairs.
-    """
-    b = int(((hits_a == 1) & (hits_b == 0)).sum())
-    c = int(((hits_a == 0) & (hits_b == 1)).sum())
-    p = 1.0 if b + c == 0 else binomtest(min(b, c), b + c, 0.5).pvalue
-    return p, b, c
-
 
 method_hits = {
     "Baseline":                  recall10_hits(evaluation_results_baseline),
